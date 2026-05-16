@@ -41,12 +41,12 @@ For face detection we use the yolov8n model that we already got given. The detec
 - Deduplication radius, because we knew that faces won't be set close together, this made sure that slightly offset detections of the same face were not seen as different faces.
 - Approach offset, this made sure that our robot didn't try to go directly into the marker of the robot but instead went to the position slightly away from the marker before greeting.
 - Median of positions, whenever we saw a face, (which wasn't too far) we put every single detection of said face into one array, before making the actual marker, we looked at those positions and took the median as the position that would eventually be the marker. We chose the median instead of the mean, because the robot would sometimes detect the center points of the face on the edge of a nearby box, which would greatly effect the mean calculation and at the end make the result wrong.
-
+- We also added checkers if the face is inside the map and if so, if its on a wall.
 
 ## 2.3 Ring Detection
 ### 2.3.1 Detection
 
-The actual detection part, we did by using the opencv library houghCircles function, which does Hough transform circle detection on the RGB image. We tried using the same depth image Hough transform as in the simulation but the depth image information comes too slow. This introduced new problems like detecing any round objects instead of just rings. Rarely but sometimes a round back of the head gets classified as a circle. DOPISI
+The actual detection part, we did by using the opencv library houghCircles function, which does Hough transform circle detection on the RGB image. We tried using the same depth image Hough transform as in the simulation but the depth image information comes too slow. This introduced new problems like detecing any round objects instead of just rings. Rarely but sometimes a round back of the head gets classified as a circle. DOPISI how tf smo nrdil da ne zazna unih fake krogov na skatlah. We also added checkers if the ring is inside the map and if so, if its near a wall (box).
 
 ### 2.3.2 Color classification
 
@@ -68,8 +68,9 @@ For navigation we set several keypoints on the map, where the robot walked aroun
 
 ### 3.1.2 Room 2
 
-## 3.2 Face Detection
 
+
+## 3.2 Face Detection
 ### 3.2.1 Detection
 
 For face detection we use the yolov8n model that we already got given. The detection in the simulation worked well, but we needed to add some adjustments so that the detections and then positions of the markers were more robust. The biggest things were: 
@@ -117,10 +118,10 @@ This gave us good results.
 
 Because the dialogue processing is different for men and women, we made a simple state machine. Depending on who we are talking to, we will know this from gender classification we either use the male of female state machine. For men we just do the step by step check mentioned in 3.4.2, while for women we have if statements and booleans in place to take care of the correct logic.
 
-### 3.5 Cylinder detection
+## 3.5 Cylinder detection
 
 
-### 3.6 PDF-generation
+## 3.6 PDF-generation
 
 
-### 3.7 Anomaly detection
+## 3.7 Anomaly detection
