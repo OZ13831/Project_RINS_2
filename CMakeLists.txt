@@ -62,8 +62,13 @@ install(PROGRAMS
   scripts/capture_oakd_image.py
   scripts/face_classification_publisher.py
   scripts/line_follower.py
+  scripts/line_follower_left.py
   scripts/detect_rings.py
-#  scripts/robot_commander.py
+  scripts/detect_spill.py
+  scripts/detect_spill2.py
+  scripts/detect_tile_anomaly.py
+  scripts/robot_commander.py
+  scripts/save_ring_hist.py
 
   DESTINATION lib/${PROJECT_NAME})
 

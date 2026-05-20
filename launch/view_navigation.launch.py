@@ -38,10 +38,11 @@ ARGUMENTS = [
 
 def generate_launch_description():
 
-    pkg_turtlebot4_viz = get_package_share_directory('turtlebot4_viz')
+    # Use the local dis_tutorial3 rviz config (includes /confirmed_objects + /cylinder_markers)
+    pkg_dis_tutorial3 = get_package_share_directory('dis_tutorial3')
 
     rviz2_config = PathJoinSubstitution(
-        [pkg_turtlebot4_viz, 'rviz', 'navigation.rviz'])
+        [pkg_dis_tutorial3, 'rviz', 'navigation.rviz'])
 
     namespace = LaunchConfiguration('namespace')
 

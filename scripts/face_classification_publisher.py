@@ -50,7 +50,6 @@ class FaceClassificationPublisher(Node):
                 ("image_topic", "/oakd/rgb/preview/image_raw"),
                 ("pointcloud_topic", "/oakd/rgb/preview/depth/points"),
                 ("publish_topic", "/face_class"),
-                ("markers_topic", "/face_classifier/markers"),
                 ("detector_model", "yolov8n.pt"),
                 ("classifier_model", "/home/gamma/colcon_ws/face_classification/runs/classify/train/weights/best.pt"),
                 ("device", ""),
@@ -59,7 +58,6 @@ class FaceClassificationPublisher(Node):
                 ("max_detection_distance", 1.5),
                 ("normal_window_size", 20),
                 ("min_valid_depth_points", 10),
-                ("marker_lifetime_sec", 2.0),
                 ("marker_z_offset", 0.0),
                 ("confirmed_face_min_dist", 0.50),
             ],
@@ -68,7 +66,6 @@ class FaceClassificationPublisher(Node):
         self.image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
         self.pointcloud_topic = self.get_parameter("pointcloud_topic").get_parameter_value().string_value
         self.publish_topic = self.get_parameter("publish_topic").get_parameter_value().string_value
-        self.markers_topic = self.get_parameter("markers_topic").get_parameter_value().string_value
         self.detector_model_path = self.get_parameter("detector_model").get_parameter_value().string_value
         self.classifier_model_path = self.get_parameter("classifier_model").get_parameter_value().string_value
         self.device = self.get_parameter("device").get_parameter_value().string_value
@@ -77,7 +74,6 @@ class FaceClassificationPublisher(Node):
         self.max_detection_distance = float(self.get_parameter("max_detection_distance").value)
         self.normal_window_size = int(self.get_parameter("normal_window_size").value)
         self.min_valid_depth_points = int(self.get_parameter("min_valid_depth_points").value)
-        self.marker_lifetime_sec = float(self.get_parameter("marker_lifetime_sec").value)
         self.marker_z_offset = float(self.get_parameter("marker_z_offset").value)
         self.confirmed_face_min_dist = float(self.get_parameter("confirmed_face_min_dist").value)
 
@@ -95,11 +91,8 @@ class FaceClassificationPublisher(Node):
         self.confirmed_face_count = 0
         self.confirmed_goals = []    # avg_goal positions of all committed faces
 
-        # --- RViz Marker Extension ---
-        # Publishes sphere + arrow markers per detection.
-        # Sphere = 3D center of bounding box on wall (map frame)
-        # Arrow = wall surface normal pointing into room, scaled to standoff_distance
-        # Arrow tip = recommended robot navigation goal to face the detection
+        # Image + pointcloud time-sync. Per-frame markers are deliberately NOT published —
+        # we only emit /face_classifier/confirmed_markers once 15 detections are buffered.
         self.image_sub_mf = message_filters.Subscriber(
             self, Image, self.image_topic, qos_profile=qos_profile_sensor_data
         )
@@ -112,7 +105,6 @@ class FaceClassificationPublisher(Node):
         self.sync.registerCallback(self.synced_callback)
 
         self.class_pub = self.create_publisher(String, self.publish_topic, 10)
-        self.marker_pub = self.create_publisher(MarkerArray, self.markers_topic, 10)
         self.confirmed_marker_pub = self.create_publisher(
             MarkerArray, "/face_classifier/confirmed_markers", 10
         )
@@ -149,14 +141,31 @@ class FaceClassificationPublisher(Node):
         goal_msg.pose.orientation.w = qw
         self.face_goal_pub.publish(goal_msg)
 
-        # Persistent confirmed marker (lifetime=0 = forever)
+        # Confirmed publish: face center (red), goal/standoff point (yellow),
+        # arrow center→goal (cyan), and a label. Robot_commander relays into /confirmed_objects.
         confirmed_array = MarkerArray()
+
+        center_sphere = Marker()
+        center_sphere.header.frame_id = self.map_frame
+        center_sphere.header.stamp = now_stamp
+        center_sphere.ns = "face_center"
+        center_sphere.id = face_id * 4
+        center_sphere.type = Marker.SPHERE
+        center_sphere.action = Marker.ADD
+        center_sphere.pose.position.x = float(avg_center[0])
+        center_sphere.pose.position.y = float(avg_center[1])
+        center_sphere.pose.position.z = float(avg_center[2]) + self.marker_z_offset
+        center_sphere.pose.orientation.w = 1.0
+        center_sphere.scale.x = center_sphere.scale.y = center_sphere.scale.z = 0.2
+        center_sphere.color.r = 1.0
+        center_sphere.color.a = 1.0
+        confirmed_array.markers.append(center_sphere)
 
         goal_sphere = Marker()
         goal_sphere.header.frame_id = self.map_frame
         goal_sphere.header.stamp = now_stamp
         goal_sphere.ns = "face_goal"
-        goal_sphere.id = face_id * 2
+        goal_sphere.id = face_id * 4 + 1
         goal_sphere.type = Marker.SPHERE
         goal_sphere.action = Marker.ADD
         goal_sphere.pose.position.x = float(avg_goal[0])
@@ -166,24 +175,41 @@ class FaceClassificationPublisher(Node):
         goal_sphere.scale.x = goal_sphere.scale.y = goal_sphere.scale.z = 0.3
         goal_sphere.color.r = 1.0
         goal_sphere.color.g = 1.0
-        goal_sphere.color.b = 0.0
         goal_sphere.color.a = 1.0
         confirmed_array.markers.append(goal_sphere)
+
+        arrow = Marker()
+        arrow.header.frame_id = self.map_frame
+        arrow.header.stamp = now_stamp
+        arrow.ns = "face_normal"
+        arrow.id = face_id * 4 + 2
+        arrow.type = Marker.ARROW
+        arrow.action = Marker.ADD
+        tail = Point(); tail.x, tail.y, tail.z = float(avg_center[0]), float(avg_center[1]), float(avg_center[2]) + self.marker_z_offset
+        head = Point(); head.x, head.y, head.z = float(avg_goal[0]),   float(avg_goal[1]),   float(avg_goal[2])   + self.marker_z_offset
+        arrow.points = [tail, head]
+        arrow.scale.x = 0.05
+        arrow.scale.y = 0.10
+        arrow.scale.z = 0.10
+        arrow.color.g = 0.8
+        arrow.color.b = 1.0
+        arrow.color.a = 0.9
+        confirmed_array.markers.append(arrow)
 
         label = Marker()
         label.header.frame_id = self.map_frame
         label.header.stamp = now_stamp
-        label.ns = "face_goal_label"
-        label.id = face_id * 2 + 1
+        label.ns = "face_label"
+        label.id = face_id * 4 + 3
         label.type = Marker.TEXT_VIEW_FACING
         label.action = Marker.ADD
-        label.pose.position.x = float(avg_goal[0])
-        label.pose.position.y = float(avg_goal[1])
-        label.pose.position.z = float(avg_goal[2]) + self.marker_z_offset + 0.25
+        label.pose.position.x = float(avg_center[0])
+        label.pose.position.y = float(avg_center[1])
+        label.pose.position.z = float(avg_center[2]) + self.marker_z_offset + 0.25
         label.pose.orientation.w = 1.0
         label.scale.z = 0.15
         label.color.r = label.color.g = label.color.b = label.color.a = 1.0
-        label.text = f"Face #{face_id} goal"
+        label.text = f"Face #{face_id}"
         confirmed_array.markers.append(label)
 
         self.confirmed_marker_pub.publish(confirmed_array)
@@ -215,13 +241,6 @@ class FaceClassificationPublisher(Node):
             det_results = self.detector.predict(
                 source=cv_image, classes=[0], verbose=False, device=self.device
             )
-
-            marker_array = MarkerArray()
-            delete_all = Marker()
-            delete_all.action = Marker.DELETEALL
-            marker_array.markers.append(delete_all)
-
-            marker_id = 0
 
             for box in det_results[0].boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -351,74 +370,20 @@ class FaceClassificationPublisher(Node):
                 if too_close:
                     continue
 
-                # Accumulate toward confirmed detection
+                # Accumulate toward confirmed detection (median over 15 frames)
                 self.detection_buffer.append((p_center, p_goal))
                 n_buf = len(self.detection_buffer)
                 cv2.putText(
                     cv_image,
-                    f"Buffering: {n_buf}/50",
+                    f"Buffering: {n_buf}/15",
                     (x1, min(y2 + 20, cv_image.shape[0] - 5)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (0, 200, 255),
                     2,
                 )
-                if n_buf >= 50:
+                if n_buf >= 15:
                     self._commit_face()
-
-                now_stamp = self.get_clock().now().to_msg()
-                lifetime = Duration(seconds=self.marker_lifetime_sec).to_msg()
-
-                sphere = Marker()
-                sphere.header.frame_id = self.map_frame
-                sphere.header.stamp = now_stamp
-                sphere.ns = "face_center"
-                sphere.id = marker_id
-                marker_id += 1
-                sphere.type = Marker.SPHERE
-                sphere.action = Marker.ADD
-                sphere.pose.position.x = p_center[0]
-                sphere.pose.position.y = p_center[1]
-                sphere.pose.position.z = p_center[2] + self.marker_z_offset
-                sphere.pose.orientation.w = 1.0
-                sphere.scale.x = 0.15
-                sphere.scale.y = 0.15
-                sphere.scale.z = 0.15
-                sphere.color.r = 1.0
-                sphere.color.g = 0.0
-                sphere.color.b = 0.0
-                sphere.color.a = 0.9
-                sphere.lifetime = lifetime
-                marker_array.markers.append(sphere)
-
-                arrow = Marker()
-                arrow.header.frame_id = self.map_frame
-                arrow.header.stamp = now_stamp
-                arrow.ns = "face_normal_arrow"
-                arrow.id = marker_id
-                marker_id += 1
-                arrow.type = Marker.ARROW
-                arrow.action = Marker.ADD
-                tail = Point()
-                tail.x = p_center[0]
-                tail.y = p_center[1]
-                tail.z = p_center[2] + self.marker_z_offset
-                head = Point()
-                head.x = p_goal[0]
-                head.y = p_goal[1]
-                head.z = p_goal[2] + self.marker_z_offset
-                arrow.points = [tail, head]
-                arrow.scale.x = 0.05
-                arrow.scale.y = 0.10
-                arrow.scale.z = 0.10
-                arrow.color.r = 0.0
-                arrow.color.g = 0.8
-                arrow.color.b = 1.0
-                arrow.color.a = 0.9
-                arrow.lifetime = lifetime
-                marker_array.markers.append(arrow)
-
-            self.marker_pub.publish(marker_array)
 
             cv2.imshow("face_classification", cv_image)
             cv2.waitKey(1)

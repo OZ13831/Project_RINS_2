@@ -47,6 +47,11 @@ class ArmMoverAction(Node):
             'garage':[0.,-0.45,2.8,-0.8],
             'up':[0.,0.,0.,0.],
             'down':[0.,0.45,0.82,1.68],
+            'ring': [0.,0, 1.57, 0.],
+            # Camera looks at the floor ~0.3 m ahead of the robot.
+            # Arm pitched forward; with the -pi/2 camera mount the lens points down-forward.
+            # Tune wrist angle if the framing needs adjustment.
+            'look_for_spill':[0., 1.3, -0.5, 1.5],
             'manual':None
         }
 

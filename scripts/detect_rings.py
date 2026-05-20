@@ -12,11 +12,15 @@ from sensor_msgs_py import point_cloud2 as pc2
 from sensor_msgs.msg import Image
 
 from std_msgs.msg import String
-from cv_bridge import CvBridge, CvBridgeError
+from geometry_msgs.msg import PointStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from rclpy.qos import qos_profile_sensor_data, QoSReliabilityPolicy
+
+import tf2_ros
+from tf2_ros import Buffer, TransformListener
+from tf2_geometry_msgs import do_transform_point
 ALREADY_SAVED = False
 qos_profile = QoSProfile(
           durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
@@ -48,7 +52,7 @@ def predict_color(ring_img, mask=None):
 
 
     # Create histograms folder if it doesn't exist
-    hist_folder = "/home/gamma/colcon_ws/avg_hist"
+    hist_folder = "/home/gamma/colcon_ws/task2_avg_hist"
     if not os.path.exists(hist_folder):
         os.makedirs(hist_folder)
     
@@ -95,7 +99,7 @@ def predict_color(ring_img, mask=None):
                 second_best = score
 
     iowe_ratio = second_best / best_score if second_best != float('inf') else 1.0
-    print(f"Best match: {best_match} with score {best_score}, IOWE ratio: {iowe_ratio}")
+    print(f"Best match: {best_match} with distance {best_score}, IOWE ratio: {iowe_ratio}")
     colors = ['red', 'green', 'blue']
     for color in colors:
         if best_match.startswith(color) and iowe_ratio > 1.2:
@@ -115,10 +119,12 @@ class RingDetector(Node):
         self.ecc_thr = 100
         self.ratio_thr = 1.5
         self.center_thr = 10
-        # An object we use for converting images between ROS format and OpenCV format
-        self.bridge = CvBridge()
         self.rings = None
         self.circles = None
+
+        cv2.namedWindow("Depth", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Mask", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("RGB + Mask", cv2.WINDOW_NORMAL)
         # Subscribe to the image and/or depth topic
         self.image_sub = self.create_subscription(Image, "/top_camera/rgb/preview/image_raw", self.image_callback, qos_profile_sensor_data)
         self.depth_sub = self.create_subscription(Image, "/top_camera/rgb/preview/depth", self.depth_callback, qos_profile_sensor_data)
@@ -131,20 +137,22 @@ class RingDetector(Node):
         self.last_color = ""
         self.position_buffer = []
         self.color_buffer = []
+
+        # TF buffer/listener for transforming pointcloud-frame centroids into the map frame
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         
-        #cv2.namedWindow("Binary Image", cv2.WINDOW_NORMAL)
-        #cv2.namedWindow("Detected contours", cv2.WINDOW_NORMAL)
-        # cv2.namedWindow("Detected rings", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("Depth window", cv2.WINDOW_NORMAL)        
 
     def image_callback(self, data):
         if not hasattr(self, 'rings') or self.rings is None:
             return
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
-        except CvBridgeError as e:
+            cv_image = np.frombuffer(data.data, dtype=np.uint8).reshape(data.height, data.width, -1)
+            if data.encoding.lower() == 'rgb8':
+                cv_image = cv_image[:, :, ::-1].copy()
+        except Exception as e:
             print(e)
-
+            return
 
         color = predict_color(cv_image, self.rings)
         if color != "":
@@ -153,15 +161,22 @@ class RingDetector(Node):
             color_msg.data = color
             print("Publishing color: ", color)
             self.color_pub.publish(color_msg)
-        
-        cv2.imshow("Mask", self.rings)
-        cv2.imshow("cv_image ", cv_image)
+
+        # Overlay: dim everything outside the mask, tint inside yellow
+        mask = self.rings
+        if mask.shape[:2] != cv_image.shape[:2]:
+            mask = cv2.resize(mask, (cv_image.shape[1], cv_image.shape[0]))
+        overlay = cv_image.copy().astype(np.float32)
+        overlay[mask == 0] *= 0.25                          # dim outside, full pixels inside
+        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+        cv2.imshow("RGB + Mask", overlay)
+        cv2.waitKey(1)
 
 
-    def depth_callback(self,data):
+    def depth_callback(self, data):
         try:
-            depth_image = self.bridge.imgmsg_to_cv2(data, "32FC1")
-        except CvBridgeError as e:
+            depth_image = np.frombuffer(data.data, dtype=np.float32).reshape(data.height, data.width)
+        except Exception as e:
             print(e)
             return
 
@@ -178,7 +193,6 @@ class RingDetector(Node):
         image_1 = depth_image / 65536.0 * 255
         image_1 = image_1/np.max(image_1)*255
         #image_1 = 255 - image_1
-        image_copy = np.array(image_1, dtype=np.uint8)
         mask = np.zeros(depth_image.shape, dtype=np.uint8)
         self.circles = cv2.HoughCircles(image_1.astype(np.uint8),cv2.HOUGH_GRADIENT,1,20,param1=70,param2=20,minRadius=1,maxRadius=30)
         if self.circles is not None:
@@ -202,11 +216,8 @@ class RingDetector(Node):
 
             self.rings = mask.copy()
 
-        #print("Circles found:", self.circles)
-        image_viz = np.array(image_1, dtype= np.uint8)
-        mask_viz = np.array(mask, dtype= np.uint8)
-        cv2.imshow("Depth window", image_viz)
-        #cv2.imshow("Mask window", mask_viz)
+        cv2.imshow("Depth", image_1.astype(np.uint8))
+        cv2.imshow("Mask", mask)
         cv2.waitKey(1)
 
     def pointcloud_callback(self, data):
@@ -251,10 +262,27 @@ class RingDetector(Node):
         self.position_buffer.append(center)
         self.color_buffer.append(self.last_color)
 
-        if len(self.position_buffer) < 100:
+        if len(self.position_buffer) < 20:
             return
 
         avg_center = np.mean(self.position_buffer, axis=0)
+
+        # Transform centroid from the pointcloud's camera frame into the global map frame.
+        # Without this, ring positions are interpreted as base_link coords (very wrong).
+        src_frame = data.header.frame_id
+        try:
+            tf = self.tf_buffer.lookup_transform('map', src_frame, rclpy.time.Time())
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warn(f'TF {src_frame}->map unavailable: {e}')
+            return  # keep accumulating; retry on next callback
+
+        pt = PointStamped()
+        pt.header.frame_id = src_frame
+        pt.point.x = float(avg_center[0])
+        pt.point.y = float(avg_center[1])
+        pt.point.z = float(avg_center[2])
+        pt_map = do_transform_point(pt, tf)
+
         color_counts = Counter(c for c in self.color_buffer if c != "")
         detected_color = color_counts.most_common(1)[0][0] if color_counts else ""
         self.position_buffer = []
@@ -271,15 +299,15 @@ class RingDetector(Node):
         ring_label = f"ring {self.confirmed_ring_count}"
 
         sphere = Marker()
-        sphere.header.frame_id = "/base_link"
+        sphere.header.frame_id = "map"
         sphere.header.stamp = data.header.stamp
         sphere.ns = "rings"
         sphere.id = self.confirmed_ring_count * 2
         sphere.type = Marker.SPHERE
         sphere.action = Marker.ADD
-        sphere.pose.position.x = float(avg_center[0])
-        sphere.pose.position.y = float(avg_center[1])
-        sphere.pose.position.z = float(avg_center[2])
+        sphere.pose.position.x = pt_map.point.x
+        sphere.pose.position.y = pt_map.point.y
+        sphere.pose.position.z = pt_map.point.z
         sphere.pose.orientation.w = 1.0
         sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.3
         sphere.color.r = r
@@ -288,15 +316,15 @@ class RingDetector(Node):
         sphere.color.a = 1.0
 
         label = Marker()
-        label.header.frame_id = "/base_link"
+        label.header.frame_id = "map"
         label.header.stamp = data.header.stamp
         label.ns = "ring_labels"
         label.id = self.confirmed_ring_count * 2 + 1
         label.type = Marker.TEXT_VIEW_FACING
         label.action = Marker.ADD
-        label.pose.position.x = float(avg_center[0])
-        label.pose.position.y = float(avg_center[1])
-        label.pose.position.z = float(avg_center[2]) + 0.2
+        label.pose.position.x = pt_map.point.x
+        label.pose.position.y = pt_map.point.y
+        label.pose.position.z = pt_map.point.z + 0.2
         label.pose.orientation.w = 1.0
         label.scale.z = 0.15
         label.color.r = label.color.g = label.color.b = label.color.a = 1.0
@@ -304,7 +332,7 @@ class RingDetector(Node):
 
         marker_array = MarkerArray()
         marker_array.markers = [sphere, label]
-        print(f"Confirmed {ring_label} at {avg_center}, color={detected_color}")
+        print(f"Confirmed {ring_label} at ({pt_map.point.x:.2f}, {pt_map.point.y:.2f}, {pt_map.point.z:.2f}), color={detected_color}")
         self.ring_pub.publish(marker_array)
 def main():
 
@@ -312,7 +340,6 @@ def main():
     rd_node = RingDetector()
 
     rclpy.spin(rd_node)
-
     cv2.destroyAllWindows()
 
 
