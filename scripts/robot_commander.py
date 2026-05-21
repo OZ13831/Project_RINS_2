@@ -10,6 +10,7 @@ from builtin_interfaces.msg import Duration
 from geometry_msgs.msg import Point, PoseStamped, PoseWithCovarianceStamped, Quaternion
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose, Spin
+from std_msgs.msg import Bool, String
 from turtle_tf2_py.turtle_tf2_broadcaster import quaternion_from_euler
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -68,6 +69,14 @@ class RobotCommander(Node):
         self.create_subscription(Marker, '/cylinder_markers', self._cylinder_cb, 10)
         self.create_subscription(MarkerArray, '/face_classifier/confirmed_markers', self._face_cb, 10)
         self.objects_pub = self.create_publisher(MarkerArray, '/confirmed_objects', 10)
+
+        self.arm_pub = self.create_publisher(String, '/arm_command', 10)
+        self._start_detection_pub = self.create_publisher(Bool, '/start_detection', 10)
+
+        self._color_match    = None   # set by /color_match from detect_tile_anomaly
+        self._detection_done = False  # set by /detection_done from detect_tile_anomaly
+        self.create_subscription(Bool, '/color_match',    self._color_match_cb,    10)
+        self.create_subscription(Bool, '/detection_done', self._detection_done_cb, 10)
 
         self.get_logger().info('RobotCommander ready')
 
@@ -175,6 +184,13 @@ class RobotCommander(Node):
     def _feedback_cb(self, msg):
         self.feedback = msg.feedback
 
+    def _color_match_cb(self, msg: Bool):
+        self._color_match = msg.data
+
+    def _detection_done_cb(self, msg: Bool):
+        if msg.data:
+            self._detection_done = True
+
     # ── Detection callbacks ──────────────────────────────────────────────────
 
     def _rings_cb(self, msg):
@@ -184,7 +200,8 @@ class RobotCommander(Node):
             self.get_logger().info(f'First /rings msg received ({len(msg.markers)} markers)')
         for m in msg.markers:
             if m.ns == 'rings':
-                self._add_observation('ring', m.pose.position.x, m.pose.position.y)
+                self._add_observation('ring', m.pose.position.x, m.pose.position.y,
+                                      m.color.r, m.color.g, m.color.b)
 
     def _cylinder_cb(self, msg):
         # Vertical vs horizontal is encoded in the namespace by cylinder_segmentation.cpp
@@ -192,9 +209,11 @@ class RobotCommander(Node):
         if self._cyl_msg_count == 1:
             self.get_logger().info(f'First /cylinder_markers msg (ns={msg.ns})')
         if msg.ns == 'cylinder':
-            self._add_observation('cyl_vert', msg.pose.position.x, msg.pose.position.y)
+            self._add_observation('cyl_vert',  msg.pose.position.x, msg.pose.position.y,
+                                  msg.color.r, msg.color.g, msg.color.b)
         elif msg.ns == 'cylinder_horizontal':
-            self._add_observation('cyl_horiz', msg.pose.position.x, msg.pose.position.y)
+            self._add_observation('cyl_horiz', msg.pose.position.x, msg.pose.position.y,
+                                  msg.color.r, msg.color.g, msg.color.b)
 
     def _face_cb(self, msg):
         # face_classification_publisher already medians 15 frames; one msg = one confirmed face.
@@ -247,7 +266,7 @@ class RobotCommander(Node):
         # Redraw every confirmed object in a single MarkerArray; color/ns differentiate kinds.
         # Faces additionally get a goal sphere + arrow from center → goal (the standoff point).
         palette = {
-            'ring':      (1.0, 1.0, 0.0),  # yellow
+            'ring':      (1.0, 1.0, 0.0),  # fallback yellow if no color in entry
             'cyl_vert':  (0.0, 1.0, 0.0),  # green
             'cyl_horiz': (0.0, 0.0, 1.0),  # blue
             'face':      (1.0, 0.0, 1.0),  # magenta
@@ -256,9 +275,10 @@ class RobotCommander(Node):
         mid = 0
         stamp = self.get_clock().now().to_msg()
         for kind, entries in self._confirmed.items():
-            r, g, b = palette[kind]
             for i, entry in enumerate(entries):
                 x, y = entry[0], entry[1]
+                # Rings and cylinders carry their detected color as (x, y, r, g, b)
+                r, g, b = (entry[2], entry[3], entry[4]) if kind in ('ring', 'cyl_vert', 'cyl_horiz') and len(entry) >= 5 else palette[kind]
 
                 sphere = Marker()
                 sphere.header.frame_id = 'map'
@@ -330,45 +350,89 @@ class RobotCommander(Node):
         self.objects_pub.publish(arr)
 
 
+def _navigate(rc, x, y, qz, qw, label):
+    goal = PoseStamped()
+    goal.header.frame_id = 'map'
+    goal.header.stamp = rc.get_clock().now().to_msg()
+    goal.pose.position.x = x
+    goal.pose.position.y = y
+    goal.pose.orientation.z = qz
+    goal.pose.orientation.w = qw
+
+    rc.get_logger().info(f'→ {label}')
+    if not rc.go_to_pose(goal):
+        rc.get_logger().error(f'{label}: goal rejected')
+        return False
+
+    while not rc.is_task_complete():
+        rclpy.spin_once(rc, timeout_sec=0.1)
+
+    result = rc.get_result()
+    rc.get_logger().info(f'{label} result: {result}')
+    return result != TaskResult.FAILED
+
+
 def main():
     rclpy.init()
     rc = RobotCommander()
     rc.wait_until_nav2_active()
 
-    # Waypoints copied from points.yaml (x, y, qz, qw)
+    rc.arm_pub.publish(String(data='ring'))
+    rc.get_logger().info('Arm → rings')
+
     positions = [
         (-2.6569306611436088,   0.16201769689870127,  0.1107997044644789,   0.9938427569241445),
-        (-4.3069673497168885,  -0.9610489716983373,   0.785944750453859,    0.6182967323494611),
+        (-3.816358212773971,  -0.9086231768172194,    0.6172894726642737,   0.786736110101642),
+        #(-2.9503815926671053,   -3.2369627304892323,  0.4752767559043263,   0.8798363514296619),
         (-1.9658334873514014,  -3.248015988877124,    0.35379317043051733,  0.9353236833079354),
-        (-1.2193167449510325,  -1.7361916636833115,   0.7089521216516188,   0.7052566123090718),
-        (-0.21022026415384767,  -4.284759737487124,  -0.03349020160328896,  0.999439045863514),
+        (-1.2682009393012044,  -1.7584973254372267,   0.6963050240259081,   0.7177459951238178),
+        (0.2534043595121116,  -4.266760998946057,    -0.07499761435754064,  0.9971837131846256),
+        (-1.3306695404030213,   -4.268996079835222,  -0.999950799039901,    0.009919652184605814),
+        (-1.255948004244705, -3.5475625400361914,    0.8650829533991125,   0.501628830648986),
         ( 0.7975906528003365,  -2.803675605193642,    0.024640921542908818, 0.9996963663960754),
-        ( 0.024602486672440412, -0.6436527675802777,  0.7524657221444425,   0.6586314120945361),
+        ( 0.024602486672440412, -0.6436527675802777,  0.5724657221444425,   0.8206314120945361),
     ]
 
+    anomaly_positions = [
+        ( 0.23561884813549774, -3.9968579196473355, -0.6708838823574673, 0.7415624157095423),
+        (-3.8830870946035407,  -2.4773224378833913, -0.995463176601127,  0.09514759077976365),
+    ]
+
+    # ── Phase 1: regular waypoints ────────────────────────────────────────────
     for i, (x, y, qz, qw) in enumerate(positions):
-        goal = PoseStamped()
-        goal.header.frame_id = 'map'
-        goal.header.stamp = rc.get_clock().now().to_msg()
-        goal.pose.position.x = x
-        goal.pose.position.y = y
-        goal.pose.orientation.z = qz
-        goal.pose.orientation.w = qw
-
-        rc.get_logger().info(f'Waypoint {i + 1}/{len(positions)}')
-        if not rc.go_to_pose(goal):
-            rc.get_logger().error(f'Waypoint {i + 1} rejected, skipping')
-            continue
-
-        while not rc.is_task_complete():
-            # spin instead of sleep so detection callbacks fire while we drive
-            rclpy.spin_once(rc, timeout_sec=0.1)
-
-        result = rc.get_result()
-        rc.get_logger().info(f'Waypoint {i + 1} result: {result}')
-        if result == TaskResult.FAILED:
+        if not _navigate(rc, x, y, qz, qw, f'Waypoint {i + 1}/{len(positions)}'):
             rc.get_logger().error('Navigation failed, aborting')
             break
+        time.sleep(0.5)
+
+    # ── Phase 2: face positions ───────────────────────────────────────────────
+    face_entries = rc._confirmed['face']
+    rc.get_logger().info(f'Navigating to {len(face_entries)} confirmed face(s).')
+    for i, face_entry in enumerate(face_entries):
+        cx, cy, gx, gy = face_entry
+        yaw = math.atan2(cy - gy, cx - gx)
+        q = quaternion_from_euler(0, 0, yaw)
+        _navigate(rc, gx, gy, float(q[2]), float(q[3]), f'Face {i + 1}')
+
+    # ── Phase 3: anomaly inspection ───────────────────────────────────────────
+    _navigate(rc, *anomaly_positions[0], 'Anomaly position 1')
+    rc._start_detection_pub.publish(Bool(data=True))
+    rc.get_logger().info('Detection triggered at anomaly position 1. Waiting for /detection_done...')
+    while not rc._detection_done:
+        rclpy.spin_once(rc, timeout_sec=0.1)
+    rc.get_logger().info('Detection done at position 1.')
+
+    if not rc._color_match:
+        rc.get_logger().info('Color mismatch — proceeding to anomaly position 2.')
+        rc._detection_done = False
+        _navigate(rc, *anomaly_positions[1], 'Anomaly position 2')
+        rc._start_detection_pub.publish(Bool(data=True))
+        rc.get_logger().info('Detection triggered at anomaly position 2. Waiting for /detection_done...')
+        while not rc._detection_done:
+            rclpy.spin_once(rc, timeout_sec=0.1)
+        rc.get_logger().info('Detection done at position 2.')
+    else:
+        rc.get_logger().info('Color matched — skipping anomaly position 2.')
 
     rc.destroy_node()
     rclpy.shutdown()

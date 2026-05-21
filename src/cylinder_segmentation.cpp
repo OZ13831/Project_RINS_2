@@ -31,7 +31,7 @@ std::shared_ptr<rclcpp::Node> node;
 std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
 std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
 
-typedef pcl::PointXYZ PointT;
+typedef pcl::PointXYZRGB PointT;
 
 // parameters
 float error_margin = 0.04;  // 4 cm margin for radius error
@@ -216,10 +216,19 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
             marker.scale.y = detected_radius * 2;
             marker.scale.z = marker_height;
 
-            marker.color.r = 0.0f;
-            marker.color.g = 1.0f;
-            marker.color.b = 0.0f;
-            marker.color.a = 1.0f;
+            {
+                float r_sum = 0.0f, g_sum = 0.0f, b_sum = 0.0f;
+                for (const auto& pt : cloud_cylinder->points) {
+                    r_sum += static_cast<float>(pt.r);
+                    g_sum += static_cast<float>(pt.g);
+                    b_sum += static_cast<float>(pt.b);
+                }
+                float n = static_cast<float>(cloud_cylinder->points.size());
+                marker.color.r = (n > 0) ? r_sum / (n * 255.0f) : 0.0f;
+                marker.color.g = (n > 0) ? g_sum / (n * 255.0f) : 1.0f;
+                marker.color.b = (n > 0) ? b_sum / (n * 255.0f) : 0.0f;
+                marker.color.a = 1.0f;
+            }
 
             marker.lifetime = rclcpp::Duration(0, 1);
 
@@ -345,10 +354,19 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
             marker.scale.y = detected_radius * 2;
             marker.scale.z = marker_height;
 
-            marker.color.r = 0.0f;
-            marker.color.g = 0.0f;
-            marker.color.b = 1.0f;
-            marker.color.a = 1.0f;
+            {
+                float r_sum = 0.0f, g_sum = 0.0f, b_sum = 0.0f;
+                for (const auto& pt : cloud_cylinder_h->points) {
+                    r_sum += static_cast<float>(pt.r);
+                    g_sum += static_cast<float>(pt.g);
+                    b_sum += static_cast<float>(pt.b);
+                }
+                float n = static_cast<float>(cloud_cylinder_h->points.size());
+                marker.color.r = (n > 0) ? r_sum / (n * 255.0f) : 0.0f;
+                marker.color.g = (n > 0) ? g_sum / (n * 255.0f) : 0.0f;
+                marker.color.b = (n > 0) ? b_sum / (n * 255.0f) : 1.0f;
+                marker.color.a = 1.0f;
+            }
 
             marker.lifetime = rclcpp::Duration(0, 1);
             marker_pub->publish(marker);

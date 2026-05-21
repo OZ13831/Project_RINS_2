@@ -55,7 +55,7 @@ class FaceClassificationPublisher(Node):
                 ("device", ""),
                 ("map_frame", "map"),
                 ("standoff_distance", 0.5),
-                ("max_detection_distance", 1.5),
+                ("max_detection_distance", 2.0),
                 ("normal_window_size", 20),
                 ("min_valid_depth_points", 10),
                 ("marker_z_offset", 0.0),
