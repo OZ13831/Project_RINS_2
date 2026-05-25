@@ -71,6 +71,7 @@ class LineFollowerLeft(Node):
                 ("angular_gain",                1.5),    # P-gain mapping centroid error → angular velocity
                 ("max_angular_speed",           1.0),    # hard cap on |angular.z| (rad/s) for PID, TURN and TURN_180
                 ("search_angular_speed",        0.3),    # in-place spin rate (rad/s) used while line is lost (FOLLOW dead-end probe)
+                ("pid_left_bias",               0.15),   # shift PID target right by this fraction of half-width, biasing all motion left
 
                 # ── Line color (HSV) ──────────────────────────────────────────
                 ("hsv_lower",                   [90, 80, 50]),     # lower HSV bound for the blue line — must be a 3-element list
@@ -83,23 +84,23 @@ class LineFollowerLeft(Node):
 
                 # ── Dead-end / junction hysteresis ────────────────────────────
                 ("dead_end_frames",             15),     # consecutive line-lost frames in FOLLOW before triggering TURN_180
-                ("crossroad_hysteresis_frames", 3),      # consecutive junction frames required before committing to a TURN
+                ("crossroad_hysteresis_frames", 2),      # consecutive junction frames required before committing to a TURN
 
                 # ── Branch-detection ring (full-image angular histogram) ──────
                 ("robot_anchor_x_ratio",        0.5),    # anchor X (fraction of width) — where the "robot is" in image space
-                ("robot_anchor_y_ratio",        0.95),   # anchor Y — pushed near the bottom so back = image-down
+                ("robot_anchor_y_ratio",        0.85),   # anchor Y — raised slightly so the ring reaches farther-ahead branch splits
                 ("ring_inner_ratio",            0.3),    # inner radius of the sampling ring as a fraction of min(w, h)
-                ("ring_outer_ratio",            0.45),   # outer radius of the sampling ring as a fraction of min(w, h)
+                ("ring_outer_ratio",            0.65),   # outer radius increased to capture Y-junction branches farther from anchor
                 ("angle_bins",                  36),     # number of angular histogram bins around the anchor (here 10° each)
-                ("min_pixels_per_bin",          5),      # min line pixels in a bin for it to count as "hot" (part of a branch)
-                ("back_tolerance_rad",          0.25),    # tolerance (rad ≈ 29°) within which a branch is treated as the back-pointing one and filtered out
-                ("forward_snap_rad",            0.1),   # if the chosen branch is within this rad (≈ 14°) of straight ahead, stay in FOLLOW instead of TURN
+                ("min_pixels_per_bin",          5),      # lowered so thin far-field branches still register as hot bins
+                ("back_tolerance_rad",          0.2),    # tolerance (rad ≈ 11°) within which a branch is treated as the back-pointing one and filtered out
+                ("forward_snap_rad",            0.2),   # if the chosen branch is within this rad (≈ 14°) of straight ahead, stay in FOLLOW instead of TURN
 
                 # ── Anti-spin guards around junctions ─────────────────────────
-                ("crossroad_match_radius",      0.4),    # if the bot is within this many map-frame metres of the last junction, suppress re-firing
+                ("crossroad_match_radius",      0.3),    # if the bot is within this many map-frame metres of the last junction, suppress re-firing
                 ("crossroad_cooldown_sec",      4.0),    # time cooldown (s) after a junction before another can be committed
-                ("drive_out_sec",               7.0),    # forced DRIVE_OUT duration (s) after every TURN, to push past the junction before re-checking
-                ("turn_tolerance",              0.10),   # |yaw error| (rad) under which TURN is considered complete
+                ("drive_out_sec",               8.0),    # reduced so junction detection re-arms sooner after a turn
+                ("turn_tolerance",              0.1),   # |yaw error| (rad) under which TURN is considered complete
                 ("turn_180_settle_sec",         1.0),    # extra stationary settle time (s) at the end of TURN_180 before resuming forward motion
 
                 # ── Debug ─────────────────────────────────────────────────────
@@ -118,6 +119,8 @@ class LineFollowerLeft(Node):
         self.last_crossroad_xy = None
         self.crossroad_cooldown_until = 0.0
         self.collision_detected = False
+        self._settle_until = 0.0
+        self._forward_until = 0.0
 
         # Set by _step_follow each frame for the debug renderer
         self._debug_chosen_idx = None
@@ -152,6 +155,7 @@ class LineFollowerLeft(Node):
         self.angular_gain             = float(gp("angular_gain").value)
         self.max_angular_speed        = float(gp("max_angular_speed").value)
         self.search_angular_speed     = float(gp("search_angular_speed").value)
+        self.pid_left_bias            = float(gp("pid_left_bias").value)
         self.roi_y_start_ratio        = max(0.0, min(1.0, float(gp("roi_y_start_ratio").value)))
         self.roi_y_end_ratio          = max(0.0, min(1.0, float(gp("roi_y_end_ratio").value)))
         self.min_line_area            = int(gp("min_line_area").value)
@@ -343,7 +347,9 @@ class LineFollowerLeft(Node):
         if m["m00"] <= 0:
             return 0.0, self.search_angular_speed
         cx = int(m["m10"] / m["m00"])
-        error_norm = (cx - width / 2.0) / (width / 2.0)
+        # Target is shifted right by pid_left_bias so the robot always steers left.
+        target = width / 2.0 * (1.0 + self.pid_left_bias)
+        error_norm = (cx - target) / (width / 2.0)
         angular = max(-self.max_angular_speed,
                       min(self.max_angular_speed,
                           -self.angular_gain * error_norm))
@@ -480,10 +486,45 @@ class LineFollowerLeft(Node):
         self.cmd_pub.publish(self._twist(0.0, ang))
 
     def _step_turn_180(self, elapsed):
-        # In-place rotate until ~π is covered, then hold stationary for a brief
-        # settle so inertia stops and the camera stabilises before DRIVE_OUT
-        # commands any forward motion.
-        full_turn = math.pi / self.max_angular_speed
+        # On the first frame, lock in a yaw target of current_yaw + π.
+        if self.target_yaw is None and elapsed < 0.15:
+            pose = self._robot_pose_map()
+            if pose is not None:
+                self.target_yaw = _wrap_angle(pose[2] + math.pi)
+
+        if self._forward_until > 0.0:
+            # Settle done — drive straight forward for 1 second then hand off.
+            self.cmd_pub.publish(self._twist(self.linear_speed, 0.0))
+            if time.time() >= self._forward_until:
+                self._forward_until = 0.0
+                self._transition(DRIVE_OUT)
+            return
+
+        if self._settle_until > 0.0:
+            # Yaw reached — hold completely still until settle time expires.
+            self.cmd_pub.publish(self._twist(0.0, 0.0))
+            if time.time() >= self._settle_until:
+                self._settle_until = 0.0
+                self._forward_until = time.time() + 1.0
+            return
+
+        if self.target_yaw is not None:
+            # TF-based: spin left until we reach the target yaw.
+            pose = self._robot_pose_map()
+            if pose is not None:
+                _, _, yaw = pose
+                err = _wrap_angle(self.target_yaw - yaw)
+                if abs(err) < self.turn_tolerance:
+                    self.target_yaw = None
+                    self._settle_until = time.time() + self.turn_180_settle_sec
+                    self.cmd_pub.publish(self._twist(0.0, 0.0))
+                    return
+                ang = max(0.2, min(self.max_angular_speed, 2.5 * abs(err)))
+                self.cmd_pub.publish(self._twist(0.0, ang))  # always left
+                return
+
+        # Timed fallback when TF is unavailable — add 40% extra time for inertia.
+        full_turn = math.pi / self.max_angular_speed * 1.4
         settle_end = full_turn + self.turn_180_settle_sec
         if elapsed < full_turn:
             self.cmd_pub.publish(self._twist(0.0, self.max_angular_speed))

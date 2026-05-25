@@ -63,12 +63,14 @@ install(PROGRAMS
   scripts/face_classification_publisher.py
   scripts/line_follower.py
   scripts/line_follower_left.py
+  scripts/line_follower_new.py
   scripts/detect_rings.py
   scripts/detect_spill.py
   scripts/detect_spill2.py
   scripts/detect_tile_anomaly.py
   scripts/robot_commander.py
   scripts/save_ring_hist.py
+  scripts/spill_detector.py
 
   DESTINATION lib/${PROJECT_NAME})
 
