@@ -116,9 +116,16 @@ def _ring_color_breakdown(rings: list[tuple]) -> Counter:
 def _match_spills_to_horizontal(horizontals, spills, snapshots: dict,
                                  max_dist: float = 0.8) -> list[dict]:
     out, used = [], set()
+    # cyl_horiz entries are (cx, cy, gx, gy, r, g, b) — see robot_commander._cyl_horiz_cb.
+    # Legacy (cx, cy, r, g, b) tuples are still tolerated for older recordings.
     for b in horizontals:
         bx, by = b[0], b[1]
-        col = (b[2], b[3], b[4]) if len(b) >= 5 else (0.0, 0.0, 0.0)
+        if len(b) >= 7:
+            col = (b[4], b[5], b[6])
+        elif len(b) >= 5:
+            col = (b[2], b[3], b[4])
+        else:
+            col = (0.0, 0.0, 0.0)
         best_i, best_d = -1, max_dist
         for i, s in enumerate(spills):
             if i in used:

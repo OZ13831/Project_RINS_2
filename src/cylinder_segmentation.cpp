@@ -27,7 +27,17 @@ rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr planes_pub;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cylinder_pub;            // vertical (standing) cylinders
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cylinder_horizontal_pub; // horizontal (laying) cylinders
 rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub;
+// Enriched per-detection bundle (center + side-facing goal + normal arrow) for
+// horizontal barrels only. robot_commander reads goal from this topic so it can
+// approach the barrel from the side instead of from the top or bottom.
+rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr horizontal_array_pub;
 rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr confirmed_sub;
+
+// Distance (m) from the barrel centroid to the standoff goal, along the
+// perpendicular-to-axis direction that faces the camera. Picked far enough
+// back that the OAK-D can see both the barrel side and the ground around it
+// for spill detection.
+const float HORIZONTAL_STANDOFF = 1.0f;
 
 std::shared_ptr<rclcpp::Node> node;
 std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
@@ -408,6 +418,101 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
             marker.lifetime = rclcpp::Duration(0, 1);
             marker_pub->publish(marker);
 
+            // ── Side-facing standoff / outward normal (camera frame → map frame) ──
+            // Approach the barrel from the side (perpendicular to the cylinder
+            // axis), not from above/below. Project the camera→centroid vector
+            // onto the plane perpendicular to the fitted axis to get the
+            // outward normal, then push out by HORIZONTAL_STANDOFF.
+            Eigen::Vector3f P_center_cam(centroid[0], centroid[1], centroid[2]);
+            Eigen::Vector3f A(coeffs_h->values[3], coeffs_h->values[4], coeffs_h->values[5]);
+            A.normalize();
+            Eigen::Vector3f to_cam = -P_center_cam;
+            Eigen::Vector3f n_perp = to_cam - to_cam.dot(A) * A;
+            float n_len = n_perp.norm();
+            if (n_len < 1e-3f) {
+                // Degenerate: camera is essentially on the barrel axis line.
+                // Pick any axis-perpendicular fallback so we still publish a goal.
+                Eigen::Vector3f fallback = A.cross(Eigen::Vector3f::UnitZ());
+                if (fallback.norm() < 1e-3f) fallback = A.cross(Eigen::Vector3f::UnitX());
+                n_perp = fallback;
+                n_len = n_perp.norm();
+            }
+            Eigen::Vector3f n_outward = n_perp / n_len;
+            Eigen::Vector3f P_standoff_cam = P_center_cam + HORIZONTAL_STANDOFF * n_outward;
+
+            geometry_msgs::msg::PointStamped standoff_camera, standoff_map;
+            standoff_camera.header.frame_id = msg->header.frame_id;
+            standoff_camera.header.stamp = now;
+            standoff_camera.point.x = P_standoff_cam.x();
+            standoff_camera.point.y = P_standoff_cam.y();
+            standoff_camera.point.z = P_standoff_cam.z();
+            try {
+                auto tss_standoff = tf_buffer_->lookupTransform("map", msg->header.frame_id, now);
+                tf2::doTransform(standoff_camera, standoff_map, tss_standoff);
+            } catch (tf2::TransformException& ex) {
+                std::cout << "standoff transform failed: " << ex.what() << std::endl;
+                // Fall back to the barrel centre — robot_commander will still
+                // navigate, just without the side-facing offset for this frame.
+                standoff_map.point.x = point_map_h.point.x;
+                standoff_map.point.y = point_map_h.point.y;
+                standoff_map.point.z = point_map_h.point.z;
+            }
+
+            // Bundle: center (the cylinder marker above, re-emitted), goal sphere,
+            // and a center→goal normal arrow. Mirrors face_classification_publisher's
+            // (face_center / face_goal / face_normal) namespace pattern.
+            visualization_msgs::msg::MarkerArray h_array;
+
+            visualization_msgs::msg::Marker center_marker = marker;  // copy ns/id/pose/color
+            h_array.markers.push_back(center_marker);
+
+            visualization_msgs::msg::Marker goal_marker;
+            goal_marker.header.frame_id = "map";
+            goal_marker.header.stamp = now;
+            goal_marker.ns = "cylinder_horizontal_goal";
+            goal_marker.id = marker.id;
+            goal_marker.type = visualization_msgs::msg::Marker::SPHERE;
+            goal_marker.action = visualization_msgs::msg::Marker::ADD;
+            goal_marker.pose.position.x = standoff_map.point.x;
+            goal_marker.pose.position.y = standoff_map.point.y;
+            goal_marker.pose.position.z = standoff_map.point.z;
+            goal_marker.pose.orientation.w = 1.0;
+            goal_marker.scale.x = goal_marker.scale.y = goal_marker.scale.z = 0.2;
+            goal_marker.color.r = 1.0f;
+            goal_marker.color.g = 1.0f;
+            goal_marker.color.b = 0.0f;
+            goal_marker.color.a = 1.0f;
+            goal_marker.lifetime = rclcpp::Duration(0, 1);
+            h_array.markers.push_back(goal_marker);
+
+            visualization_msgs::msg::Marker normal_marker;
+            normal_marker.header.frame_id = "map";
+            normal_marker.header.stamp = now;
+            normal_marker.ns = "cylinder_horizontal_normal";
+            normal_marker.id = marker.id;
+            normal_marker.type = visualization_msgs::msg::Marker::ARROW;
+            normal_marker.action = visualization_msgs::msg::Marker::ADD;
+            geometry_msgs::msg::Point tail, head;
+            tail.x = point_map_h.point.x;
+            tail.y = point_map_h.point.y;
+            tail.z = point_map_h.point.z;
+            head.x = standoff_map.point.x;
+            head.y = standoff_map.point.y;
+            head.z = standoff_map.point.z;
+            normal_marker.points.push_back(tail);
+            normal_marker.points.push_back(head);
+            normal_marker.scale.x = 0.04;
+            normal_marker.scale.y = 0.08;
+            normal_marker.scale.z = 0.08;
+            normal_marker.color.r = 0.0f;
+            normal_marker.color.g = 0.8f;
+            normal_marker.color.b = 1.0f;
+            normal_marker.color.a = 0.9f;
+            normal_marker.lifetime = rclcpp::Duration(0, 1);
+            h_array.markers.push_back(normal_marker);
+
+            horizontal_array_pub->publish(h_array);
+
             *all_cylinders_horizontal += *cloud_cylinder_h;
             sum_x_h += point_map_h.point.x;
             sum_y_h += point_map_h.point.y;
@@ -544,6 +649,8 @@ int main(int argc, char** argv) {
     cylinder_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("cylinder_point_cloud_vertical", 1);
     cylinder_horizontal_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>("cylinder_point_cloud_horizontal", 1);
     marker_pub = node->create_publisher<visualization_msgs::msg::Marker>("cylinder_markers", 1);
+    horizontal_array_pub = node->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "cylinder_markers_horizontal", 10);
 
     rclcpp::spin(node);
     rclcpp::shutdown();

@@ -152,8 +152,8 @@ class TileAnomalyDetector(Node):
         self._detection_done_pub = self.create_publisher(Bool,    '/detection_done', 10)
 
         self._state          = self.STATE_IDLE
-        self._expected_color = 'red'              # hardcoded for demo
-        self.TILE_LIMIT      = self.TILE_LIMIT_RED
+        self._expected_color = 'green'              # hardcoded for demo
+        self.TILE_LIMIT      = self.TILE_LIMIT_GREEN
 
         # Tile counting state
         self._tile_count     = 0     # total tiles whose bbox has covered then left centre
@@ -252,7 +252,7 @@ class TileAnomalyDetector(Node):
         self.get_logger().info('Detection triggered — arm → down; waiting 3.5 s...')
         if hasattr(self, '_arm_ready_timer'):
             self._arm_ready_timer.cancel()
-        self._arm_ready_timer = self.create_timer(3.5, self._arm_ready_cb)
+        self._arm_ready_timer = self.create_timer(5.0, self._arm_ready_cb)
         self._state = self.STATE_APPROACH
 
     # ── Belt proximity detection ──────────────────────────────────────────────
