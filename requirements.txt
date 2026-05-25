@@ -1,0 +1,26 @@
+# Third-party Python dependencies for dis_tutorial7.
+# ROS 2 packages (rclpy, *_msgs, cv_bridge, tf2_*, message_filters, sensor_msgs_py,
+# turtle_tf2_py, irobot_create_msgs) are installed via apt / colcon and are not
+# listed here. Project-internal modules (speech_intent, inspection_report,
+# model.supersimplenet) are part of this repo.
+
+# Computer vision / numerics
+numpy
+opencv-python
+scipy
+matplotlib
+
+# Deep learning
+torch
+ultralytics            # YOLOv8 (detect_rings, face_classification_publisher)
+deepface               # face_classification_publisher
+retina-face            # imported as `retinaface` — DeepFace's RetinaFace backend
+
+# Speech I/O
+SpeechRecognition      # imported as `speech_recognition`
+pyaudio                # required by SpeechRecognition.Microphone and pydub playback
+pydub                  # audio.py — load / play wav/mp3
+piper-tts              # imported as `piper` — offline TTS (PiperVoice, SynthesisConfig)
+
+# Reporting
+reportlab              # inspection_report.py — PDF builder

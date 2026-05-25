@@ -60,38 +60,50 @@ class LineFollowerLeft(Node):
         self.declare_parameters(
             namespace="",
             parameters=[
-                ("image_topic",                 "/top_camera/rgb/preview/image_raw"),
-                ("cmd_vel_topic",               "/cmd_vel"),
-                ("hazard_topic",                "/hazard_detection"),
-                ("cmd_frame_id",                ""),
-                ("linear_speed",                0.115),
-                ("angular_gain",                1.5),
-                ("max_angular_speed",           1.0),
-                ("search_angular_speed",        0.3),
-                ("hsv_lower",                   [90, 80, 50]),
-                ("hsv_upper",                   [130, 255, 255]),
-                ("roi_y_start_ratio",           0.05),
-                ("roi_y_end_ratio",             0.85),
-                ("min_line_area",               500),
-                ("dead_end_frames",             15),
-                ("crossroad_hysteresis_frames", 3),
-                # Branch-detection ring
-                ("robot_anchor_x_ratio",        0.5),
-                ("robot_anchor_y_ratio",        0.9),
-                ("ring_inner_ratio",            0.30),
-                ("ring_outer_ratio",            0.45),
-                ("angle_bins",                  36),
-                ("min_pixels_per_bin",          5),
-                ("back_tolerance_rad",          0.4),     # ~34°
-                ("forward_snap_rad",            0.35),    # ~20°
-                # Anti-spin
-                ("crossroad_match_radius",      0.4),
-                ("crossroad_cooldown_sec",      4.0),
-                ("drive_out_sec",               1.5),
-                ("turn_tolerance",              0.10),
-                ("turn_180_settle_sec",         0.5),
-                # Debug
-                ("debug_show_mask",             True),
+                # ── I/O topics ────────────────────────────────────────────────
+                ("image_topic",                 "/top_camera/rgb/preview/image_raw"),  # downward-facing camera feed used to find the line
+                ("cmd_vel_topic",               "/cmd_vel"),                            # where to publish drive commands (TwistStamped)
+                ("hazard_topic",                "/hazard_detection"),                   # iRobot Create bump/hazard events; triggers TURN_180
+                ("cmd_frame_id",                ""),                                    # frame_id stamped on cmd_vel (empty = leave blank)
+
+                # ── Drive speeds ──────────────────────────────────────────────
+                ("linear_speed",                0.115),  # forward cruise speed (m/s) when centred on the line
+                ("angular_gain",                1.5),    # P-gain mapping centroid error → angular velocity
+                ("max_angular_speed",           1.0),    # hard cap on |angular.z| (rad/s) for PID, TURN and TURN_180
+                ("search_angular_speed",        0.3),    # in-place spin rate (rad/s) used while line is lost (FOLLOW dead-end probe)
+
+                # ── Line color (HSV) ──────────────────────────────────────────
+                ("hsv_lower",                   [90, 80, 50]),     # lower HSV bound for the blue line — must be a 3-element list
+                ("hsv_upper",                   [130, 255, 255]),  # upper HSV bound; defaults span typical sim blue
+
+                # ── PID ROI (vertical fraction of the frame) ──────────────────
+                ("roi_y_start_ratio",           0.05),   # top edge of the PID centroid ROI as a fraction of image height
+                ("roi_y_end_ratio",             0.9),    # bottom edge of the PID centroid ROI; tighten to ignore far-field clutter
+                ("min_line_area",               500),    # min mask area (pixels) inside the ROI to count the line as "found"
+
+                # ── Dead-end / junction hysteresis ────────────────────────────
+                ("dead_end_frames",             15),     # consecutive line-lost frames in FOLLOW before triggering TURN_180
+                ("crossroad_hysteresis_frames", 3),      # consecutive junction frames required before committing to a TURN
+
+                # ── Branch-detection ring (full-image angular histogram) ──────
+                ("robot_anchor_x_ratio",        0.5),    # anchor X (fraction of width) — where the "robot is" in image space
+                ("robot_anchor_y_ratio",        0.95),   # anchor Y — pushed near the bottom so back = image-down
+                ("ring_inner_ratio",            0.3),    # inner radius of the sampling ring as a fraction of min(w, h)
+                ("ring_outer_ratio",            0.45),   # outer radius of the sampling ring as a fraction of min(w, h)
+                ("angle_bins",                  36),     # number of angular histogram bins around the anchor (here 10° each)
+                ("min_pixels_per_bin",          5),      # min line pixels in a bin for it to count as "hot" (part of a branch)
+                ("back_tolerance_rad",          0.25),    # tolerance (rad ≈ 29°) within which a branch is treated as the back-pointing one and filtered out
+                ("forward_snap_rad",            0.1),   # if the chosen branch is within this rad (≈ 14°) of straight ahead, stay in FOLLOW instead of TURN
+
+                # ── Anti-spin guards around junctions ─────────────────────────
+                ("crossroad_match_radius",      0.4),    # if the bot is within this many map-frame metres of the last junction, suppress re-firing
+                ("crossroad_cooldown_sec",      4.0),    # time cooldown (s) after a junction before another can be committed
+                ("drive_out_sec",               7.0),    # forced DRIVE_OUT duration (s) after every TURN, to push past the junction before re-checking
+                ("turn_tolerance",              0.10),   # |yaw error| (rad) under which TURN is considered complete
+                ("turn_180_settle_sec",         1.0),    # extra stationary settle time (s) at the end of TURN_180 before resuming forward motion
+
+                # ── Debug ─────────────────────────────────────────────────────
+                ("debug_show_mask",             True),   # show the OpenCV debug window with ring / branches / state overlay
             ],
         )
 

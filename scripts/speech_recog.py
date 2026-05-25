@@ -2,7 +2,7 @@ import ctypes
 from ctypes.util import find_library
 import os
 import speech_recognition as sr
-from rins.Project_RINS_2.speech_intent import get_intent
+from speech_intent import get_intent
 
 ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(
     None,
@@ -68,7 +68,7 @@ while True:
         start_conversation = False
 
     try:
-        with sr.Microphone(device_index=9) as source:
+        with sr.Microphone(device_index=9, sample_rate=48000) as source:
             print("Listening...")
             
             r.adjust_for_ambient_noise(source, duration=0.2)

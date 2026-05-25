@@ -5,10 +5,11 @@ from pydub.playback import play
 
 voice = PiperVoice.load("./en_US-lessac-medium.onnx")
 
-with wave.open("nothing.wav", "wb") as wav_file:
-    voice.synthesize_wav("No task will be performed.", wav_file)
+with wave.open("spill.wav", "wb") as wav_file:
+    voice.synthesize_wav("I detected a spill when inspecting the barrels.", wav_file)
 
-sound = AudioSegment.from_file("nothing.wav", format="wav")
+sound = AudioSegment.from_file("spill.wav", format="wav")
+sound = sound.set_frame_rate(48000)
 play(sound)
 # song = AudioSegment.from_wav("never_gonna_give_you_up.wav")
 

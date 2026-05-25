@@ -111,11 +111,13 @@ class FaceClassificationPublisher(Node):
         self.face_goal_pub = self.create_publisher(PoseStamped, "/face_goal", 10)
 
     def _commit_face(self) -> None:
-        centers = np.array([c for c, _ in self.detection_buffer])
-        goals   = np.array([g for _, g in self.detection_buffer])
+        centers = np.array([c for c, _, _ in self.detection_buffer])
+        goals   = np.array([g for _, g, _ in self.detection_buffer])
+        classes = [cls for _, _, cls in self.detection_buffer]
         self.detection_buffer = []
         avg_center = np.median(centers, axis=0)
         avg_goal   = np.median(goals, axis=0)
+        committed_class = max(set(classes), key=classes.count)
 
         self.confirmed_face_count += 1
         face_id = self.confirmed_face_count
@@ -211,6 +213,24 @@ class FaceClassificationPublisher(Node):
         label.color.r = label.color.g = label.color.b = label.color.a = 1.0
         label.text = f"Face #{face_id}"
         confirmed_array.markers.append(label)
+
+        # Carry the YOLO classifier label downstream; robot_commander parses
+        # the text on arrival to decide gender etc.
+        cls_marker = Marker()
+        cls_marker.header.frame_id = self.map_frame
+        cls_marker.header.stamp = now_stamp
+        cls_marker.ns = "face_class"
+        cls_marker.id = face_id
+        cls_marker.type = Marker.TEXT_VIEW_FACING
+        cls_marker.action = Marker.ADD
+        cls_marker.pose.position.x = float(avg_center[0])
+        cls_marker.pose.position.y = float(avg_center[1])
+        cls_marker.pose.position.z = float(avg_center[2]) + self.marker_z_offset + 0.45
+        cls_marker.pose.orientation.w = 1.0
+        cls_marker.scale.z = 0.15
+        cls_marker.color.r = cls_marker.color.g = cls_marker.color.b = cls_marker.color.a = 1.0
+        cls_marker.text = committed_class
+        confirmed_array.markers.append(cls_marker)
 
         self.confirmed_marker_pub.publish(confirmed_array)
 
@@ -371,7 +391,7 @@ class FaceClassificationPublisher(Node):
                     continue
 
                 # Accumulate toward confirmed detection (median over 15 frames)
-                self.detection_buffer.append((p_center, p_goal))
+                self.detection_buffer.append((p_center, p_goal, top_class_name))
                 n_buf = len(self.detection_buffer)
                 cv2.putText(
                     cv_image,

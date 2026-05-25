@@ -21,11 +21,13 @@
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
 #include "visualization_msgs/msg/marker.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
 
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr planes_pub;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cylinder_pub;            // vertical (standing) cylinders
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cylinder_horizontal_pub; // horizontal (laying) cylinders
 rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub;
+rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr confirmed_sub;
 
 std::shared_ptr<rclcpp::Node> node;
 std::shared_ptr<tf2_ros::TransformListener> tf_listener_{nullptr};
@@ -37,6 +39,35 @@ typedef pcl::PointXYZRGB PointT;
 float error_margin = 0.04;  // 4 cm margin for radius error
 float target_radius = 0.11; // 11cm radius
 bool verbose = false;
+
+// Dedup: detections within this radius of an already-confirmed cylinder of
+// matching orientation are silently discarded. Populated from /confirmed_objects.
+float dedup_radius = 0.75f;
+std::vector<std::pair<double, double>> confirmed_vert;
+std::vector<std::pair<double, double>> confirmed_horiz;
+
+static bool near_confirmed(const std::vector<std::pair<double, double>>& confirmed,
+                           double x, double y) {
+    for (const auto& c : confirmed) {
+        if (std::hypot(c.first - x, c.second - y) < dedup_radius) return true;
+    }
+    return false;
+}
+
+void confirmed_objects_cb(const visualization_msgs::msg::MarkerArray::SharedPtr msg) {
+    // robot_commander republishes the full confirmed set on every update, so
+    // we can simply rebuild our local lists from each message.
+    confirmed_vert.clear();
+    confirmed_horiz.clear();
+    for (const auto& m : msg->markers) {
+        if (m.type != visualization_msgs::msg::Marker::SPHERE) continue;
+        if (m.ns == "cyl_vert") {
+            confirmed_vert.emplace_back(m.pose.position.x, m.pose.position.y);
+        } else if (m.ns == "cyl_horiz") {
+            confirmed_horiz.emplace_back(m.pose.position.x, m.pose.position.y);
+        }
+    }
+}
 
 // cloud filtering
 float x_limit_low = 0;
@@ -190,8 +221,10 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
             break;
         }
 
-        // accept cylinders within margin
-        if ((std::abs(detected_radius - target_radius) <= error_margin) && (cylinder_points_count>=min_cylinder_size)) {
+        // accept cylinders within margin; drop those near an already-confirmed vertical cylinder
+        if ((std::abs(detected_radius - target_radius) <= error_margin)
+            && (cylinder_points_count >= min_cylinder_size)
+            && !near_confirmed(confirmed_vert, point_map.point.x, point_map.point.y)) {
 
             if (verbose) {
                 std::cerr << "Cylinder radius: " << detected_radius << std::endl;
@@ -318,6 +351,10 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
                 break;
             }
 
+            // Drop detections near an already-confirmed horizontal cylinder; inliers
+            // are still removed below so subsequent RANSAC iterations make progress.
+            if (!near_confirmed(confirmed_horiz, point_map_h.point.x, point_map_h.point.y)) {
+
             visualization_msgs::msg::Marker marker;
             marker.header.frame_id = "map";
             marker.header.stamp = now;
@@ -375,6 +412,7 @@ void cloud_cb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
             sum_x_h += point_map_h.point.x;
             sum_y_h += point_map_h.point.y;
             detected_horizontal++;
+            }  // !near_confirmed(confirmed_horiz, ...)
         }
 
         // Remove inliers from remaining cloud + normals
@@ -489,6 +527,13 @@ int main(int argc, char** argv) {
     node->declare_parameter<std::string>("topic_pointcloud_in", "/oakd/rgb/preview/depth/points");
     std::string param_topic_pointcloud_in = node->get_parameter("topic_pointcloud_in").as_string();
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription = node->create_subscription<sensor_msgs::msg::PointCloud2>(param_topic_pointcloud_in, 10, &cloud_cb);
+
+    // Confirmed-objects feedback from robot_commander: any detection within
+    // `dedup_radius` of a confirmed cylinder of matching orientation is dropped.
+    node->declare_parameter<double>("dedup_radius", dedup_radius);
+    dedup_radius = static_cast<float>(node->get_parameter("dedup_radius").as_double());
+    confirmed_sub = node->create_subscription<visualization_msgs::msg::MarkerArray>(
+        "/confirmed_objects", 10, &confirmed_objects_cb);
 
     // setup tf listener
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(node->get_clock());

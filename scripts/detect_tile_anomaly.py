@@ -163,6 +163,8 @@ class TileAnomalyDetector(Node):
         self._best_anomaly   = None  # None = tile never hit centre while can_infer was True
         self._best_score     = None
         self._best_heatmap   = None  # numpy heatmap from the best inference
+        self._best_mask      = None  # binary anomaly mask (0/255) from the best inference
+        self._best_roi       = None  # original tile ROI (BGR) from the best inference
         self._last_angular   = 0.0   # heading correction held while no tile in view
 
         os.makedirs(self.ANOMALIES_DIR, exist_ok=True)
@@ -241,6 +243,8 @@ class TileAnomalyDetector(Node):
         self._best_anomaly   = None
         self._best_score     = None
         self._best_heatmap   = None
+        self._best_mask      = None
+        self._best_roi       = None
         self._last_angular   = 0.0
         # Move arm to down and wait for it to settle before approaching
         self._arm_ready = False
@@ -396,6 +400,8 @@ class TileAnomalyDetector(Node):
                         self._best_anomaly = None
                         self._best_score = None
                         self._best_heatmap = None
+                        self._best_mask = None
+                        self._best_roi = None
 
                     elif not covers_center and self._center_covered:
                         # Bbox just left the centre pixel — count this tile.
@@ -415,10 +421,11 @@ class TileAnomalyDetector(Node):
                 anomaly = False
                 heatmap = None
                 if can_infer:
-                    score, heatmap = self._infer(roi)
+                    roi = _rectify_tile(roi)
+                    score, heatmap, mask = self._infer(roi)
                     anomaly = bool(score > self.ANOMALY_THRESHOLD)
                     if self._center_covered:
-                        self._update_best(anomaly, score, heatmap,
+                        self._update_best(anomaly, score, heatmap, mask, roi,
                                           abs(off_x) + abs(angle) / (math.pi / 4))
                     self._pub.publish(Bool(data=anomaly))
                 else:
@@ -555,9 +562,13 @@ class TileAnomalyDetector(Node):
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    def _infer(self, roi_bgr: np.ndarray) -> tuple[float, np.ndarray]:
-        """Return (sigmoid(anomaly_score), heatmap_bgr) where heatmap_bgr is a
-        colourised [H, W, 3] uint8 image ready to save."""
+    def _infer(self, roi_bgr: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+        """Return (sigmoid(anomaly_score), heatmap_bgr, mask_u8).
+
+        heatmap_bgr is a colourised [H, W, 3] uint8 image; mask_u8 is a
+        binary [H, W] uint8 image (0 / 255) of pixels whose per-pixel
+        sigmoid exceeds ANOMALY_THRESHOLD.
+        """
         roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
         roi_rgb = cv2.resize(roi_rgb, (IMAGE_SIZE[1], IMAGE_SIZE[0]))
 
@@ -573,8 +584,9 @@ class TileAnomalyDetector(Node):
         amap = torch.sigmoid(anomaly_map).squeeze().cpu().numpy()  # (H, W), [0, 1]
         amap_u8 = (amap * 255).astype(np.uint8)
         heatmap_bgr = cv2.applyColorMap(amap_u8, cv2.COLORMAP_JET)
+        mask_u8 = (amap > self.ANOMALY_THRESHOLD).astype(np.uint8) * 255
 
-        return score_val, heatmap_bgr
+        return score_val, heatmap_bgr, mask_u8
 
     # ── Driving / alignment ─────────────────────────────────────────────────────
 
@@ -613,13 +625,15 @@ class TileAnomalyDetector(Node):
     # ── Tile session / counting ──────────────────────────────────────────────────
 
     def _update_best(self, anomaly: bool, score: float, heatmap: np.ndarray,
-                     err: float) -> None:
+                     mask: np.ndarray, roi: np.ndarray, err: float) -> None:
         """Keep the best (most-centred) verdict seen while in the centre zone."""
         if err < self._best_err:
             self._best_err = err
             self._best_anomaly = anomaly
             self._best_score = score
             self._best_heatmap = heatmap
+            self._best_mask = mask
+            self._best_roi = roi.copy() if roi is not None else None
 
     def _commit_tile(self) -> None:
         """Bbox left the image centre pixel — record verdict and increment count."""
@@ -631,6 +645,8 @@ class TileAnomalyDetector(Node):
         }
         self._results.append(entry)
         self._save_heatmap(entry['index'], self._best_heatmap)
+        self._save_normal(entry['index'], self._best_roi)
+        self._save_mask(entry['index'], self._best_mask)
         self._tile_count += 1
 
         n_anom = sum(1 for r in self._results if r['anomaly'])
@@ -662,6 +678,30 @@ class TileAnomalyDetector(Node):
             self.get_logger().error(f'Could not save heatmap: {exc}',
                                     throttle_duration_sec=5.0)
 
+    def _save_normal(self, tile_index: int, roi: np.ndarray | None) -> None:
+        """Save the original tile ROI as 'tile_XXX_normal.png' next to the heatmap."""
+        if roi is None:
+            return
+        try:
+            path = os.path.join(self.ANOMALIES_DIR, f'tile_{tile_index:03d}_normal.png')
+            cv2.imwrite(path, roi)
+            self.get_logger().info(f'Normal tile saved: {path}')
+        except Exception as exc:
+            self.get_logger().error(f'Could not save normal tile: {exc}',
+                                    throttle_duration_sec=5.0)
+
+    def _save_mask(self, tile_index: int, mask: np.ndarray | None) -> None:
+        """Save the binary anomaly mask as 'tile_XXX_mask.png' (0/255)."""
+        if mask is None:
+            return
+        try:
+            path = os.path.join(self.ANOMALIES_DIR, f'tile_{tile_index:03d}_mask.png')
+            cv2.imwrite(path, mask)
+            self.get_logger().info(f'Mask saved: {path}')
+        except Exception as exc:
+            self.get_logger().error(f'Could not save mask: {exc}',
+                                    throttle_duration_sec=5.0)
+
     def _print_report(self) -> None:
         """Print a T/F anomaly summary for every inspected tile."""
         print('\n' + '=' * 36)
@@ -687,6 +727,93 @@ class TileAnomalyDetector(Node):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _rectify_tile(roi: np.ndarray, out: int = 256) -> np.ndarray:
+    """Rectify the tile via a homography fitted to its four edge lines.
+
+    Pipeline: foreground mask → silhouette edges → HoughLines → split into
+    near-horizontal vs near-vertical → keep the extreme top/bottom and
+    left/right lines → intersect pairwise to get four corners → homography
+    to an `out × out` square. Falls back to a contour-based quad when Hough
+    finds fewer than 2 lines in either direction, and returns the original
+    ROI on any unexpected error so inference still runs.
+    """
+    if roi is None or roi.size == 0:
+        return roi
+
+    def _contour_fallback(mask: np.ndarray) -> np.ndarray:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return roi
+        c = max(contours, key=cv2.contourArea)
+        approx = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
+        pts = (approx.reshape(-1, 2).astype(np.float32) if len(approx) == 4
+               else cv2.boxPoints(cv2.minAreaRect(c)).astype(np.float32))
+        s, d = pts.sum(1), np.diff(pts, axis=1).ravel()
+        src = np.array([pts[s.argmin()], pts[d.argmin()],
+                        pts[s.argmax()], pts[d.argmax()]], np.float32)
+        dst = np.array([[0, 0], [out - 1, 0], [out - 1, out - 1], [0, out - 1]], np.float32)
+        return cv2.warpPerspective(roi, cv2.getPerspectiveTransform(src, dst), (out, out))
+
+    try:
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, mask = cv2.threshold(blur, 20, 255, cv2.THRESH_BINARY)
+        # Edges of the foreground silhouette only — keeps Hough focused on the
+        # tile outline and not interior texture/cracks.
+        edges = cv2.Canny(mask, 50, 150)
+
+        h, w = roi.shape[:2]
+        min_len = int(0.25 * min(h, w))
+        lines = cv2.HoughLines(edges, 1, math.pi / 180, min_len)
+        if lines is None:
+            return _contour_fallback(mask)
+
+        horiz, vert = [], []
+        for rho, theta in lines[:, 0]:
+            # |sin θ| ≈ 1 ⇒ horizontal image line; |cos θ| ≈ 1 ⇒ vertical.
+            if abs(math.sin(theta)) > 0.7:
+                horiz.append((rho, theta))
+            elif abs(math.cos(theta)) > 0.7:
+                vert.append((rho, theta))
+        if len(horiz) < 2 or len(vert) < 2:
+            return _contour_fallback(mask)
+
+        # For mostly-axis-aligned lines, rho ≈ signed distance to origin (top-left).
+        # Sorting by rho separates the two parallel edges cleanly.
+        horiz.sort(key=lambda x: x[0])
+        vert.sort(key=lambda x: x[0])
+        top, bottom = horiz[0], horiz[-1]
+        left, right = vert[0], vert[-1]
+
+        def _intersect(l1, l2):
+            r1, t1 = l1
+            r2, t2 = l2
+            A = np.array([[math.cos(t1), math.sin(t1)],
+                          [math.cos(t2), math.sin(t2)]], dtype=np.float64)
+            b = np.array([r1, r2], dtype=np.float64)
+            return np.linalg.solve(A, b)
+
+        tl = _intersect(top, left)
+        tr = _intersect(top, right)
+        br = _intersect(bottom, right)
+        bl = _intersect(bottom, left)
+        src = np.array([tl, tr, br, bl], dtype=np.float32)
+
+        # Sanity: reject if any corner falls far outside the ROI (degenerate fit).
+        margin = 0.5 * max(h, w)
+        if (src[:, 0].min() < -margin or src[:, 0].max() > w + margin or
+                src[:, 1].min() < -margin or src[:, 1].max() > h + margin):
+            return _contour_fallback(mask)
+
+        dst = np.array([[0, 0], [out - 1, 0], [out - 1, out - 1], [0, out - 1]], np.float32)
+        H, _ = cv2.findHomography(src, dst)
+        if H is None:
+            return _contour_fallback(mask)
+        return cv2.warpPerspective(roi, H, (out, out))
+    except (cv2.error, np.linalg.LinAlgError):
+        return roi
+
 
 def _put_label(img: np.ndarray, text: str, score: float | None, anomaly: bool) -> None:
     """Overlay a status label (and score) in the top-left corner of img."""
