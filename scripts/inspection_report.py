@@ -30,6 +30,8 @@ from reportlab.platypus import (
 GROUP_NAME = 'Gamma'
 ANOMALIES_DIR = '/home/gamma/colcon_ws/anomalies'
 ANOMALY_RESULTS_PATH = '/home/gamma/colcon_ws/tile_anomaly_results.json'
+ANOMALY_RESULTS_RED_PATH   = '/home/gamma/colcon_ws/tile_anomaly_results_red.json'
+ANOMALY_RESULTS_GREEN_PATH = '/home/gamma/colcon_ws/tile_anomaly_results_green.json'
 
 
 def parse_face_class(cls: str | None) -> dict:
@@ -96,9 +98,9 @@ def _format_requester(identities: list[dict]) -> str:
     )
 
 
-def _load_anomaly_json() -> dict:
+def _load_anomaly_json(path: str) -> dict:
     try:
-        with open(ANOMALY_RESULTS_PATH) as f:
+        with open(path) as f:
             data = json.load(f)
         return {
             'total':     data.get('tiles_inspected', 0),
@@ -202,45 +204,52 @@ def generate_report(rc, output_path: str) -> None:
 
     # ── Anomaly detection ───────────────────────────────────────────────────
     elements.append(Paragraph('Anomaly Detection', h1))
-    anom_reqs = _requesters_for(face_requests, {'ANOMALY_RED', 'ANOMALY_GREEN'})
-    elements.append(Paragraph(f'Requested by: {_format_requester(anom_reqs)}', body))
 
-    cells = set(getattr(rc, 'anomaly_cells_visited', []))
-    if {'red', 'green'} <= cells:
-        cell_str = 'both red and green cells'
-    elif cells == {'red'}:
-        cell_str = 'red cell'
-    elif cells == {'green'}:
-        cell_str = 'green cell'
-    else:
-        cell_str = 'none'
-    elements.append(Paragraph(f'Cells approached: {cell_str}', body))
+    cells_visited = list(getattr(rc, 'anomaly_cells_visited', []))
 
-    anom = _load_anomaly_json()
-    elements.append(Paragraph(f'Total tiles inspected: {anom["total"]}', body))
-    elements.append(Paragraph(f'Anomalies found: {anom["anomalous"]}', body))
+    for cell_color, task_key, results_path in (
+        ('green', 'ANOMALY_GREEN', ANOMALY_RESULTS_GREEN_PATH),
+        ('red',   'ANOMALY_RED',   ANOMALY_RESULTS_RED_PATH),
+    ):
+        h2 = styles['Heading2']
+        elements.append(Paragraph(f'{cell_color.capitalize()} Cell', h2))
 
-    for entry in anom['entries']:
-        idx = entry['index']
-        normal_path = os.path.join(ANOMALIES_DIR, f'tile_{idx:03d}_normal.png')
-        heatmap_path = os.path.join(ANOMALIES_DIR, f'tile_{idx:03d}.png')
-        mask_path = os.path.join(ANOMALIES_DIR, f'tile_{idx:03d}_mask.png')
-        anomaly_flag = entry.get('anomaly')
-        if anomaly_flag is True:
-            verdict = 'ANOMALY'
-        elif anomaly_flag is False:
-            verdict = 'OK'
-        else:
-            verdict = 'uninspected'
-        score = entry.get('score')
-        score_str = f'{score:.3f}' if isinstance(score, (int, float)) else 'n/a'
-        elements.append(Paragraph(f'Tile #{idx}: {verdict} (score={score_str})', body))
-        row = []
-        for p in (normal_path, heatmap_path, mask_path):
-            if os.path.exists(p):
-                row.append(RLImage(p, width=2.0 * inch, height=1.5 * inch))
-        if row:
-            elements.append(Table([row], colWidths=[2.1 * inch] * len(row)))
-        elements.append(Spacer(1, 0.1 * inch))
+        cell_reqs = _requesters_for(face_requests, {task_key})
+        elements.append(Paragraph(f'Requested by: {_format_requester(cell_reqs)}', body))
+
+        if cell_color not in cells_visited:
+            elements.append(Paragraph('Cell not visited.', body))
+            elements.append(Spacer(1, 0.2 * inch))
+            continue
+
+        anom = _load_anomaly_json(results_path)
+        elements.append(Paragraph(f'Total tiles inspected: {anom["total"]}', body))
+        elements.append(Paragraph(f'Anomalies found: {anom["anomalous"]}', body))
+
+        for entry in anom['entries']:
+            idx = entry['index']
+            prefix = f'{cell_color}_tile_{idx:03d}'
+            normal_path  = os.path.join(ANOMALIES_DIR, f'{prefix}_normal.png')
+            heatmap_path = os.path.join(ANOMALIES_DIR, f'{prefix}.png')
+            mask_path    = os.path.join(ANOMALIES_DIR, f'{prefix}_mask.png')
+            anomaly_flag = entry.get('anomaly')
+            if anomaly_flag is True:
+                verdict = 'ANOMALY'
+            elif anomaly_flag is False:
+                verdict = 'OK'
+            else:
+                verdict = 'uninspected'
+            score = entry.get('score')
+            score_str = f'{score:.3f}' if isinstance(score, (int, float)) else 'n/a'
+            elements.append(Paragraph(f'Tile #{idx}: {verdict} (score={score_str})', body))
+            row = []
+            for p in (normal_path, heatmap_path, mask_path):
+                if os.path.exists(p):
+                    row.append(RLImage(p, width=2.0 * inch, height=1.5 * inch))
+            if row:
+                elements.append(Table([row], colWidths=[2.1 * inch] * len(row)))
+            elements.append(Spacer(1, 0.1 * inch))
+
+        elements.append(Spacer(1, 0.2 * inch))
 
     SimpleDocTemplate(output_path, pagesize=A4).build(elements)

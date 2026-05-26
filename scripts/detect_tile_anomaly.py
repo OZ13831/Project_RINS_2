@@ -94,6 +94,8 @@ class TileAnomalyDetector(Node):
     # tile, holding the previous tile's heading while none is in view.
     APPROACH_SPEED      = 0.05   # slow forward speed while driving toward the belt
     BELT_DARK_FRACTION  = 0.60   # Otsu dark-pixel fraction that means "belt fills frame"
+    BELT_ROI_FRACTION   = 1   # only the central N% × N% of the frame feeds dark_frac
+                                 # (ignores walls/floor at the image edges)
     SPIN_ANGULAR        = -0.8   # angular.z for 90° right turn (negative = clockwise)
     LINEAR_SPEED = 0.08    # forward cruise speed while a tile is tracked (m/s)
     CREEP_SPEED  = 0.06    # forward speed when no tile in view (m/s)
@@ -152,8 +154,10 @@ class TileAnomalyDetector(Node):
         self._detection_done_pub = self.create_publisher(Bool,    '/detection_done', 10)
 
         self._state          = self.STATE_IDLE
-        self._expected_color = 'green'              # hardcoded for demo
-        self.TILE_LIMIT      = self.TILE_LIMIT_GREEN
+        # Set by /color_command (from robot_commander) before /start_detection.
+        # TILE_LIMIT is keyed off the colour at the same time.
+        self._expected_color = None
+        self.TILE_LIMIT      = None
 
         # Tile counting state
         self._tile_count     = 0     # total tiles whose bbox has covered then left centre
@@ -186,6 +190,7 @@ class TileAnomalyDetector(Node):
         cv2.putText(placeholder, 'Waiting for camera...',
                     (60, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (180, 180, 180), 2, cv2.LINE_AA)
         cv2.imshow('Tile Anomaly Detector', placeholder)
+
         cv2.waitKey(1)
 
         self.get_logger().info('TileAnomalyDetector ready.')
@@ -224,16 +229,26 @@ class TileAnomalyDetector(Node):
         if color not in ('red', 'green'):
             self.get_logger().warning(f'Unknown color command: {msg.data!r}')
             return
-        if self._expected_color is None:
-            self._expected_color = color
-            self.TILE_LIMIT = self.TILE_LIMIT_RED if color == 'red' else self.TILE_LIMIT_GREEN
-            self.get_logger().info(
-                f'Color command received: {color} → TILE_LIMIT={self.TILE_LIMIT}')
+        # Only honour colour updates while idle so robot_commander can re-arm
+        # the detector with a different intent between runs without races
+        # changing the target mid-traversal.
+        if self._state != self.STATE_IDLE:
+            self.get_logger().warning(
+                f'Ignoring color command {color!r}: detector in state {self._state}')
+            return
+        self._expected_color = color
+        self.TILE_LIMIT = self.TILE_LIMIT_RED if color == 'red' else self.TILE_LIMIT_GREEN
+        self.get_logger().info(
+            f'Color command received: {color} → TILE_LIMIT={self.TILE_LIMIT}')
 
     # ── Detection trigger ─────────────────────────────────────────────────────
 
     def _start_detection_cb(self, msg: Bool) -> None:
         if not msg.data or self._state != self.STATE_IDLE:
+            return
+        if self._expected_color is None:
+            self.get_logger().warning(
+                'Detection trigger ignored: no /color_command received yet.')
             return
         # Reset per-run tile state
         self._tile_count     = 0
@@ -257,13 +272,23 @@ class TileAnomalyDetector(Node):
 
     # ── Belt proximity detection ──────────────────────────────────────────────
 
-    def _belt_in_view(self, bgr: np.ndarray) -> bool:
-        """True when the conveyor belt fills enough of the frame to start color check."""
+    def _belt_in_view(self, bgr: np.ndarray) -> tuple[bool, float, int]:
+        """Return (decision, dark_fraction, otsu_threshold)."""
+        H, W = bgr.shape[:2]
+        f = self.BELT_ROI_FRACTION
+        rx0 = int(W * (1.0 - f) / 2.0)
+        ry0 = int(H * (1.0 - f) / 2.0)
+        rx1 = W - rx0
+        ry1 = H - ry0
+
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         thresh_val, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        dark_frac = float(np.sum(blurred < thresh_val)) / blurred.size
-        return dark_frac >= self.BELT_DARK_FRACTION
+        dark_full = (blurred < thresh_val).astype(np.uint8) * 255
+        dark_roi = dark_full[ry0:ry1, rx0:rx1]
+        dark_frac = float(np.sum(dark_roi > 0)) / max(dark_roi.size, 1)
+
+        return (dark_frac >= self.BELT_DARK_FRACTION, dark_frac, int(thresh_val))
 
     # ── Floor color detection (Otsu on saturation) ────────────────────────────
 
@@ -313,7 +338,14 @@ class TileAnomalyDetector(Node):
                     cv2.waitKey(1)
                     return
 
-                if self._belt_in_view(bgr):
+                in_view, dark_frac, otsu_thr = self._belt_in_view(bgr)
+                self.get_logger().info(
+                    f'belt approach: dark_frac={dark_frac:.3f} '
+                    f'thr={self.BELT_DARK_FRACTION:.2f} otsu={otsu_thr} in_view={in_view}',
+                    throttle_duration_sec=0.5,
+                )
+
+                if in_view:
                     self._publish_twist(0.0, 0.0)
                     self.get_logger().info('Belt in view — spinning 90° right.')
                     self._state = self.STATE_SPIN
@@ -321,7 +353,11 @@ class TileAnomalyDetector(Node):
                     self._spin_timer = self.create_timer(spin_duration, self._spin_done_cb)
                 else:
                     self._publish_twist(self.APPROACH_SPEED, 0.0)
-                    _put_label(display, 'Approaching belt...', score=None, anomaly=False)
+                    _put_label(
+                        display,
+                        f'Approaching belt ({dark_frac:.2f}/{self.BELT_DARK_FRACTION:.2f})',
+                        score=None, anomaly=False,
+                    )
                 cv2.imshow('Tile Anomaly Detector', display)
                 cv2.waitKey(1)
                 return
@@ -666,24 +702,34 @@ class TileAnomalyDetector(Node):
             self.get_logger().info('Detection complete — color matched, /detection_done published. Returning to idle.')
             self._state = self.STATE_IDLE
             
+    def _tile_basename(self, tile_index: int) -> str:
+        """Return '{color}_tile_{idx:03d}' so red/green runs don't collide.
+
+        Falls back to plain 'tile_{idx}' if somehow no colour was set — saves
+        still work, but two same-run-without-color invocations could clobber
+        each other.
+        """
+        prefix = f'{self._expected_color}_' if self._expected_color else ''
+        return f'{prefix}tile_{tile_index:03d}'
+
     def _save_heatmap(self, tile_index: int, heatmap: np.ndarray | None) -> None:
         """Save the anomaly heatmap for a tile as a PNG in ANOMALIES_DIR."""
         if heatmap is None:
             return
         try:
-            path = os.path.join(self.ANOMALIES_DIR, f'tile_{tile_index:03d}.png')
-            cv2.imwrite(path, heatmap, )
+            path = os.path.join(self.ANOMALIES_DIR, f'{self._tile_basename(tile_index)}.png')
+            cv2.imwrite(path, heatmap)
             self.get_logger().info(f'Heatmap saved: {path}')
         except Exception as exc:
             self.get_logger().error(f'Could not save heatmap: {exc}',
                                     throttle_duration_sec=5.0)
 
     def _save_normal(self, tile_index: int, roi: np.ndarray | None) -> None:
-        """Save the original tile ROI as 'tile_XXX_normal.png' next to the heatmap."""
+        """Save the original tile ROI as '{color}_tile_XXX_normal.png' next to the heatmap."""
         if roi is None:
             return
         try:
-            path = os.path.join(self.ANOMALIES_DIR, f'tile_{tile_index:03d}_normal.png')
+            path = os.path.join(self.ANOMALIES_DIR, f'{self._tile_basename(tile_index)}_normal.png')
             cv2.imwrite(path, roi)
             self.get_logger().info(f'Normal tile saved: {path}')
         except Exception as exc:
@@ -691,11 +737,11 @@ class TileAnomalyDetector(Node):
                                     throttle_duration_sec=5.0)
 
     def _save_mask(self, tile_index: int, mask: np.ndarray | None) -> None:
-        """Save the binary anomaly mask as 'tile_XXX_mask.png' (0/255)."""
+        """Save the binary anomaly mask as '{color}_tile_XXX_mask.png' (0/255)."""
         if mask is None:
             return
         try:
-            path = os.path.join(self.ANOMALIES_DIR, f'tile_{tile_index:03d}_mask.png')
+            path = os.path.join(self.ANOMALIES_DIR, f'{self._tile_basename(tile_index)}_mask.png')
             cv2.imwrite(path, mask)
             self.get_logger().info(f'Mask saved: {path}')
         except Exception as exc:
@@ -717,13 +763,21 @@ class TileAnomalyDetector(Node):
         print('=' * 36 + '\n')
 
     def _save_results(self) -> None:
-        try:
-            with open(self.RESULTS_PATH, 'w') as f:
-                json.dump({'tiles_inspected': self._tile_count,
-                           'results': self._results}, f, indent=2)
-        except Exception as exc:
-            self.get_logger().error(f'Could not save results: {exc}',
-                                    throttle_duration_sec=5.0)
+        payload = {'tiles_inspected': self._tile_count, 'results': self._results}
+        paths = [self.RESULTS_PATH]
+        if self._expected_color:
+            color_path = self.RESULTS_PATH.replace(
+                'tile_anomaly_results.json',
+                f'tile_anomaly_results_{self._expected_color}.json',
+            )
+            paths.append(color_path)
+        for path in paths:
+            try:
+                with open(path, 'w') as f:
+                    json.dump(payload, f, indent=2)
+            except Exception as exc:
+                self.get_logger().error(f'Could not save results to {path}: {exc}',
+                                        throttle_duration_sec=5.0)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

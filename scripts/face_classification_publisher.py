@@ -17,6 +17,7 @@ import numpy as np
 from ultralytics import YOLO
 
 import math
+import time
 import message_filters
 import tf2_ros
 from tf2_ros import TransformException
@@ -54,7 +55,7 @@ class FaceClassificationPublisher(Node):
                 ("classifier_model", "/home/gamma/colcon_ws/face_classification/runs/classify/train/weights/best.pt"),
                 ("device", ""),
                 ("map_frame", "map"),
-                ("standoff_distance", 0.5),
+                ("standoff_distance", 1.0),
                 ("max_detection_distance", 2.0),
                 ("normal_window_size", 20),
                 ("min_valid_depth_points", 10),
@@ -111,9 +112,9 @@ class FaceClassificationPublisher(Node):
         self.face_goal_pub = self.create_publisher(PoseStamped, "/face_goal", 10)
 
     def _commit_face(self) -> None:
-        centers = np.array([c for c, _, _ in self.detection_buffer])
-        goals   = np.array([g for _, g, _ in self.detection_buffer])
-        classes = [cls for _, _, cls in self.detection_buffer]
+        centers = np.array([c for c, _, _, _ in self.detection_buffer])
+        goals   = np.array([g for _, g, _, _ in self.detection_buffer])
+        classes = [cls for _, _, cls, _ in self.detection_buffer]
         self.detection_buffer = []
         avg_center = np.median(centers, axis=0)
         avg_goal   = np.median(goals, axis=0)
@@ -390,19 +391,21 @@ class FaceClassificationPublisher(Node):
                 if too_close:
                     continue
 
-                # Accumulate toward confirmed detection (median over 15 frames)
-                self.detection_buffer.append((p_center, p_goal, top_class_name))
+                # Accumulate toward confirmed detection (median over 25 frames)
+                now = time.time()
+                self.detection_buffer = [e for e in self.detection_buffer if now - e[3] <= 10.0]
+                self.detection_buffer.append((p_center, p_goal, top_class_name, now))
                 n_buf = len(self.detection_buffer)
                 cv2.putText(
                     cv_image,
-                    f"Buffering: {n_buf}/15",
+                    f"Buffering: {n_buf}/25",
                     (x1, min(y2 + 20, cv_image.shape[0] - 5)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (0, 200, 255),
                     2,
                 )
-                if n_buf >= 15:
+                if n_buf >= 25:
                     self._commit_face()
 
             cv2.imshow("face_classification", cv_image)

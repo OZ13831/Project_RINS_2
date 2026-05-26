@@ -9,16 +9,17 @@ import json
 import math
 import os
 import re
-import signal
 import statistics
 import subprocess
 import time
 
 import cv2
+import numpy as np
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, PoseStamped, PoseWithCovarianceStamped, Quaternion, TwistStamped
+from irobot_create_msgs.msg import HazardDetectionVector
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose, Spin
 from nav_msgs.msg import OccupancyGrid
@@ -40,6 +41,8 @@ from rclpy.qos import qos_profile_sensor_data
 
 SPILLS_DIR = '/home/gamma/colcon_ws/spills'
 REPORT_DIR = '/home/gamma/colcon_ws'
+SPEECH_DIR = '/home/gamma/colcon_ws/speech_sintesis'
+AUDIO_DEVICE = 'plughw:1,0'  # HyperX Cloud II Wireless
 
 # Silence ALSA's noisy error stream so it doesn't clobber ROS logs.
 _ALSA_ERR_HANDLER = ctypes.CFUNCTYPE(
@@ -51,17 +54,118 @@ try:
 except OSError:
     pass
 
-MIC_DEVICE_INDEX = 1
+MIC_DEVICE_INDEX = 4
 MIC_SAMPLE_RATE = 48000
 
 TASK_INTENTS = {'BARRELS', 'RINGS', 'ANOMALY_RED', 'ANOMALY_GREEN', 'NOTHING'}
-RESPONSES = {
-    'BARRELS':       'Inspecting the barrels now.',
-    'RINGS':         'Counting the rings now.',
-    'ANOMALY_RED':   'Detecting anomalies in the red cell now.',
-    'ANOMALY_GREEN': 'Detecting anomalies in the green cell now.',
-    'NOTHING':       'No task will be performed.',
-}
+
+
+def play(*names):
+    """Play one or more wav files from SPEECH_DIR sequentially via aplay.
+
+    `names` may be bare basenames ('hi_man') or include the .wav extension.
+    Missing files / aplay errors are logged and swallowed — speech is non-essential.
+    """
+    for n in names:
+        if not n:
+            continue
+        fname = n if n.endswith('.wav') else f'{n}.wav'
+        path = os.path.join(SPEECH_DIR, fname)
+        if not os.path.exists(path):
+            print(f'[AUDIO] missing: {fname}')
+            continue
+        print(f'[AUDIO] {fname}')
+        try:
+            subprocess.run(
+                ['aplay', '-D', AUDIO_DEVICE, path],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            print('[AUDIO] aplay not found')
+            return
+
+
+def _digits(n) -> list[str]:
+    return list(str(int(n)))
+
+
+def say_count(n: int, unit_wav: str) -> None:
+    """Play 'there were <N> <unit>' from the prerecorded fragments."""
+    play('there_were', *_digits(n), unit_wav)
+
+
+def say_anomalies(n_anomalies: int, n_tiles: int) -> None:
+    """Play 'there were <N> anomalies in <M> tiles'."""
+    play('there_were', *_digits(n_anomalies),
+         'anomalies_in', *_digits(n_tiles), 'tiles')
+
+
+def _resolve_gender(face_class: str | None) -> str | None:
+    """Map a face class label to 'man' / 'woman' / None by substring."""
+    cls = (face_class or '').lower()
+    if 'she_her' in cls:
+        return 'woman'
+    if 'he_him' in cls:
+        return 'man'
+    return None
+
+
+def _respond_to_task(rc, task: str | None) -> None:
+    """Play the task's starting sound; for BARRELS/RINGS also announce the count."""
+    if task == 'BARRELS':
+        play('inspecting_barrels')
+        n = (len(rc._confirmed.get('cyl_vert', []))
+             + len(rc._confirmed.get('cyl_horiz', [])))
+        say_count(n, 'barrels')
+    elif task == 'RINGS':
+        play('inspecting_rings')
+        n = len(rc._confirmed.get('ring', []))
+        say_count(n, 'rings')
+    elif task == 'ANOMALY_RED':
+        play('red_anomaly')
+    elif task == 'ANOMALY_GREEN':
+        play('green_anomaly')
+    elif task == 'NOTHING':
+        play('nothing')
+
+
+def _listen_for_task(recognizer, gender: str | None) -> str | None:
+    """Block on the mic until a task is confirmed per gender rules; return it.
+
+    Woman: same task intent must be heard twice IN A ROW (any different task
+    intent resets the streak), or a YES after a task intent. NO clears state.
+    Man / unknown: the first task intent wins.
+    """
+    if gender == 'woman':
+        last_intent = None
+        while True:
+            text, intent = listen_for_command(recognizer)
+            print(f'command: {text} | intent: {intent}')
+            if intent is None:
+                continue
+            if intent == 'YES':
+                if last_intent in TASK_INTENTS:
+                    return last_intent
+            elif intent == 'NO':
+                last_intent = None
+            elif intent in TASK_INTENTS:
+                if last_intent == intent:
+                    return intent
+                last_intent = intent
+                _task_wav = {
+                    'RINGS':         'rings',
+                    'BARRELS':       'barrels',
+                    'ANOMALY_RED':   'red_anomaly',
+                    'ANOMALY_GREEN': 'green_anomaly',
+                    'NOTHING':       'nothing',
+                }.get(intent, '')
+                print(f'[SPEECH] Asking for confirmation: {intent}')
+                play('confirm_task', _task_wav)
+    while True:
+        text, intent = listen_for_command(recognizer)
+        print(f'command: {text} | intent: {intent}')
+        if intent in TASK_INTENTS:
+            return intent
 
 
 def listen_for_command(recognizer, device_index=MIC_DEVICE_INDEX, sample_rate=MIC_SAMPLE_RATE):
@@ -128,11 +232,15 @@ class RobotCommander(Node):
         # ── Detection aggregation ────────────────────────────────────────────
         # Per-kind obs threshold before emitting a median marker. Rings/faces trust
         # the upstream node (each already averages internally before publishing).
-        self.OBS_THRESHOLD = {'ring': 1, 'cyl_vert': 8, 'cyl_horiz': 8, 'face': 1, 'spill': 1}
+        self.OBS_THRESHOLD = {'ring': 1, 'cyl_vert': 10, 'cyl_horiz': 10, 'face': 1, 'spill': 1}
         self.CLUSTER_DIST = 0.5
         self.DEDUP_DIST = 0.75
+        # Seconds after which a pending observation is discarded (prevents stale
+        # obs from clustering with fresh ones seen later at a different location).
+        self.PENDING_TTL = {'ring': 10.0, 'cyl_vert': 60.0, 'cyl_horiz': 60.0, 'face': 60.0, 'spill': 60.0}
         # Entries: rings/cyls/spills store (x, y, r, g, b); faces store (cx, cy, gx, gy, class)
         self._pending = {'ring': [], 'cyl_vert': [], 'cyl_horiz': [], 'face': [], 'spill': []}
+        self._pending_times = {'ring': [], 'cyl_vert': [], 'cyl_horiz': [], 'face': [], 'spill': []}
         self._confirmed = {'ring': [], 'cyl_vert': [], 'cyl_horiz': [], 'face': [], 'spill': []}
         # Diagnostics — first-msg flags and a counter to throttle per-obs logs
         self._rings_msg_count = 0
@@ -160,6 +268,7 @@ class RobotCommander(Node):
 
         self.arm_pub = self.create_publisher(String, '/arm_command', 10)
         self._start_detection_pub = self.create_publisher(Bool, '/start_detection', 10)
+        self._color_command_pub = self.create_publisher(String, '/color_command', 10)
         self.cmd_vel_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
 
         # When False, the rings/cylinder/face/spill callbacks ignore incoming
@@ -182,6 +291,32 @@ class RobotCommander(Node):
         self._detection_done = False  # set by /detection_done from detect_tile_anomaly
         self.create_subscription(Bool, '/color_match',    self._color_match_cb,    10)
         self.create_subscription(Bool, '/detection_done', self._detection_done_cb, 10)
+
+        # ── Inline line follower ─────────────────────────────────────────────
+        self._lf_active = False
+        self._lf_processing = False
+        self._lf_state = 'follow'
+        self._lf_state_start_t = 0.0
+        self._lf_no_line_frames = 0
+        self._lf_collision = False
+        self._lf_hsv_lower = np.array([90, 80, 50], dtype=np.uint8)
+        self._lf_hsv_upper = np.array([130, 255, 255], dtype=np.uint8)
+        self._lf_bottom_strip_ratio = 0.25
+        self._lf_left_offset_px = 40
+        self._lf_linear_speed = 0.115
+        self._lf_angular_gain = 1.5
+        self._lf_max_angular_speed = 1.0
+        self._lf_min_line_area = 200
+        self._lf_dead_end_frames = 15
+        self._lf_turn_180_angular_speed = 1.0
+        self._lf_turn_180_duration_sec = 3.3
+        self._lf_wait_after_turn_sec = 1.0
+        self.create_subscription(
+            Image, '/top_camera/rgb/preview/image_raw', self._lf_image_cb, qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            HazardDetectionVector, '/hazard_detection', self._lf_hazard_cb, 10,
+        )
 
         self.get_logger().info('RobotCommander ready')
 
@@ -285,9 +420,13 @@ class RobotCommander(Node):
 
     def _amcl_cb(self, msg):
         self.initial_pose_received = True
+        # (x, y, qz, qw) — orientation is kept so we can re-issue this pose as
+        # a nav2 goal (e.g. "return to start" in the anomaly-only test).
         self._latest_robot_pose = (
             msg.pose.pose.position.x,
             msg.pose.pose.position.y,
+            msg.pose.pose.orientation.z,
+            msg.pose.pose.orientation.w,
         )
 
     def _costmap_cb(self, msg: OccupancyGrid):
@@ -524,14 +663,23 @@ class RobotCommander(Node):
     def _add_observation(self, kind, *entry):
         # entry[0], entry[1] = primary (x, y); extra coords passed through (used by face goal)
         x, y = entry[0], entry[1]
+        now = time.time()
 
         # Dedup: drop observations near an already-confirmed object of the same kind
         for known in self._confirmed[kind]:
             if math.hypot(known[0] - x, known[1] - y) < self.DEDUP_DIST:
                 return
 
+        # TTL: discard pending observations older than PENDING_TTL[kind].
+        ttl = self.PENDING_TTL.get(kind)
+        if ttl is not None and self._pending_times[kind]:
+            keep = [i for i, t in enumerate(self._pending_times[kind]) if now - t < ttl]
+            self._pending[kind]      = [self._pending[kind][i]       for i in keep]
+            self._pending_times[kind] = [self._pending_times[kind][i] for i in keep]
+
         # Cluster: pool with nearby pending observations
         self._pending[kind].append(entry)
+        self._pending_times[kind].append(now)
         nearby = [e for e in self._pending[kind]
                   if math.hypot(e[0] - x, e[1] - y) < self.CLUSTER_DIST]
 
@@ -552,10 +700,159 @@ class RobotCommander(Node):
                 for i in range(len(entry))
             )
             self._confirmed[kind].append(confirmed_entry)
-            self._pending[kind] = [e for e in self._pending[kind]
-                                   if math.hypot(e[0] - confirmed_entry[0], e[1] - confirmed_entry[1]) >= self.DEDUP_DIST]
+            keep = [i for i, e in enumerate(self._pending[kind])
+                    if math.hypot(e[0] - confirmed_entry[0], e[1] - confirmed_entry[1]) >= self.DEDUP_DIST]
+            self._pending[kind]       = [self._pending[kind][i]       for i in keep]
+            self._pending_times[kind] = [self._pending_times[kind][i] for i in keep]
             self.get_logger().info(f'Confirmed {kind} at ({confirmed_entry[0]:.2f}, {confirmed_entry[1]:.2f})')
             self._publish_objects()
+
+    # ── Inline line follower ──────────────────────────────────────────────────
+
+    def _lf_hazard_cb(self, msg: HazardDetectionVector):
+        if any(d.type == 1 for d in msg.detections):
+            self._lf_collision = True
+
+    def _lf_image_cb(self, msg: Image):
+        if not self._lf_active or self._lf_processing:
+            return
+        self._lf_processing = True
+        try:
+            bgr = self._bridge.imgmsg_to_cv2(msg, 'bgr8')
+            self._lf_step(bgr)
+        except Exception as ex:
+            self.get_logger().error(f'line_follower image_cb: {ex}')
+        finally:
+            self._lf_processing = False
+
+    def _lf_step(self, bgr: np.ndarray):
+        H, W = bgr.shape[:2]
+        now = time.time()
+
+        if self._lf_state == 'follow':
+            if self._lf_collision:
+                self._lf_transition('turn_180')
+                self._lf_collision = False
+                self._lf_no_line_frames = 0
+                self._lf_pub_twist(0.0, self._lf_turn_180_angular_speed)
+                return
+
+            strip_y0 = int(H * (1.0 - self._lf_bottom_strip_ratio))
+            strip = bgr[strip_y0:H, :]
+            hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, self._lf_hsv_lower, self._lf_hsv_upper)
+            mask = cv2.GaussianBlur(mask, (5, 5), 0)
+            mask = cv2.erode(mask, None, iterations=1)
+            mask = cv2.dilate(mask, None, iterations=2)
+
+            m = cv2.moments(mask)
+            cx = cy = None
+            display_cx = None
+            error_norm = 0.0
+
+            if m['m00'] >= self._lf_min_line_area:
+                self._lf_no_line_frames = 0
+                cx = m['m10'] / m['m00']
+                cy = m['m01'] / m['m00']
+                display_cx = cx - self._lf_left_offset_px
+                error_norm = (display_cx - W / 2.0) / (W / 2.0)
+                angular = -self._lf_angular_gain * error_norm
+                angular = max(-self._lf_max_angular_speed, min(self._lf_max_angular_speed, angular))
+                linear = self._lf_linear_speed * max(0.0, 1.0 - error_norm * error_norm)
+                self._lf_pub_twist(linear, angular)
+            else:
+                self._lf_no_line_frames += 1
+                self._lf_pub_twist(0.0, 0.0)
+                if self._lf_no_line_frames >= self._lf_dead_end_frames:
+                    self._lf_transition('turn_180')
+                    self._lf_no_line_frames = 0
+
+            self._lf_show_debug(mask, W, cx, cy, display_cx, error_norm)
+
+        elif self._lf_state == 'turn_180':
+            if now - self._lf_state_start_t < self._lf_turn_180_duration_sec:
+                self._lf_pub_twist(0.0, self._lf_turn_180_angular_speed)
+            else:
+                self._lf_pub_twist(0.0, 0.0)
+                self._lf_transition('wait')
+
+        elif self._lf_state == 'wait':
+            self._lf_pub_twist(0.0, 0.0)
+            if now - self._lf_state_start_t >= self._lf_wait_after_turn_sec:
+                self._lf_transition('follow')
+
+    def _lf_transition(self, new_state: str):
+        self._lf_state = new_state
+        self._lf_state_start_t = time.time()
+        self.get_logger().info(f'[line_follower] -> {new_state}')
+
+    def _lf_pub_twist(self, linear: float, angular: float):
+        tw = TwistStamped()
+        tw.header.stamp = self.get_clock().now().to_msg()
+        tw.twist.linear.x = float(linear)
+        tw.twist.angular.z = float(angular)
+        self.cmd_vel_pub.publish(tw)
+
+    def _lf_show_debug(self, mask, W, cx, cy, display_cx, error_norm):
+        vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        h = vis.shape[0]
+        cv2.line(vis, (W // 2, 0), (W // 2, h), (0, 255, 0), 1)
+        if cx is not None:
+            cv2.circle(vis, (int(cx), int(cy)), 4, (180, 180, 180), -1)
+            dx = int(display_cx)
+            dy = int(cy)
+            cv2.circle(vis, (dx, dy), 8, (0, 0, 255), -1)
+            cv2.line(vis, (dx - 12, dy), (dx + 12, dy), (0, 0, 255), 1)
+            cv2.line(vis, (dx, dy - 12), (dx, dy + 12), (0, 0, 255), 1)
+        cv2.putText(vis, f'state={self._lf_state}',
+                    (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        cv2.putText(vis, f'no_line={self._lf_no_line_frames}/{self._lf_dead_end_frames}',
+                    (5, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        if cx is not None:
+            cv2.putText(vis, f'cx={cx:.0f} off={self._lf_left_offset_px} err={error_norm:+.2f}',
+                        (5, 49), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        else:
+            cv2.putText(vis, 'line lost',
+                        (5, 49), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+        cv2.imshow('LineFollower', vis)
+        cv2.waitKey(1)
+
+    def follow_line_until_face(self, baseline_faces: int, face_approach_dist: float = 1.0):
+        """Run the blue-line follower in-process until a new face is within face_approach_dist metres.
+
+        Returns the face entry tuple, or None if no face was found.
+        """
+        self._lf_state = 'follow'
+        self._lf_state_start_t = time.time()
+        self._lf_no_line_frames = 0
+        self._lf_collision = False
+        self._lf_processing = False
+        self._lf_active = True
+        self.get_logger().info(f'Line follower started (baseline faces={baseline_faces})')
+
+        new_face = None
+        try:
+            while new_face is None:
+                rclpy.spin_once(self, timeout_sec=0.1)
+                if self._latest_robot_pose is None:
+                    continue
+                rx, ry = self._latest_robot_pose[0], self._latest_robot_pose[1]
+                for face_entry in self._confirmed['face'][baseline_faces:]:
+                    cx, cy = face_entry[0], face_entry[1]
+                    dist = math.hypot(rx - cx, ry - cy)
+                    if dist <= face_approach_dist:
+                        new_face = face_entry
+                        self.get_logger().info(f'Face within {dist:.2f} m — stopping line follower.')
+                        break
+        finally:
+            self._lf_active = False
+            cv2.destroyWindow('LineFollower')
+            stop = TwistStamped()
+            stop.header.stamp = self.get_clock().now().to_msg()
+            self.cmd_vel_pub.publish(stop)
+            self.get_logger().info('Line follower stopped.')
+
+        return new_face
 
     def _publish_objects(self):
         # Redraw every confirmed object in a single MarkerArray; color/ns differentiate kinds.
@@ -745,217 +1042,132 @@ def _navigate(rc, x, y, qz, qw, label):
     return result != TaskResult.FAILED
 
 
-def main():
-    """Minimal face-intent test.
+def _run_anomaly_trip(rc, cell_color, anomaly_positions, label_prefix, gx, gy, q):
+    """Drive to the anomaly cell, run detection, escape, return to (gx, gy, q),
+    then announce 'there were N anomalies in M tiles'."""
+    rc.get_logger().info(f'{label_prefix} requested {cell_color}-cell anomaly check.')
 
-    Patrols `positions` until the first face is confirmed by
-    face_classification_publisher, drives to that face, listens for one task
-    intent over the mic, and — only for ANOMALY_RED / ANOMALY_GREEN — drives
-    to the matching anomaly cell, runs detection, escapes the cell with an
-    open-loop turn+drive, then returns to the face and prints the count.
+    rc._color_command_pub.publish(String(data=cell_color))
+    rc._detection_done = False
+    rc._color_match = None
+    _navigate(rc, *anomaly_positions[cell_color],
+              f'Anomaly {cell_color} cell ({label_prefix})')
+    rc._start_detection_pub.publish(Bool(data=True))
+    rc.anomaly_cells_visited.append(cell_color)
+    rc.get_logger().info(
+        f'Detection triggered at {cell_color} cell. Waiting for /detection_done...'
+    )
+    while not rc._detection_done:
+        rclpy.spin_once(rc, timeout_sec=0.1)
+    rc.get_logger().info(f'Detection done at {cell_color} cell.')
 
-    Everything else from the full mission (barrels, spills, ring counting,
-    PDF report, blue-line follow) is intentionally NOT executed here so the
-    test can isolate the speech-driven anomaly branch. The full pipeline
-    lives in `_main_full` below and can be re-enabled by swapping names.
+    n_anomalies, n_tiles = 0, 0
+    try:
+        with open('/home/gamma/colcon_ws/tile_anomaly_results.json') as f:
+            data = json.load(f)
+        n_tiles = int(data.get('tiles_inspected', 0))
+        n_anomalies = sum(1 for r in data.get('results', []) if r.get('anomaly'))
+    except Exception as ex:
+        rc.get_logger().warn(f'Could not read tile_anomaly_results.json: {ex}')
+
+    # Open-loop escape from the cell before handing back to nav2: 3 s reverse,
+    # then a 90° right turn + 2 s forward via raw /cmd_vel. Bypasses costmap
+    # goal planning so a "stuck against the wall" state can't reject the moves.
+    rc.get_logger().info('Post-anomaly: driving backwards 3 s (raw cmd_vel)...')
+    bwd_end = time.time() + 3.0
+    while time.time() < bwd_end:
+        tw = TwistStamped()
+        tw.header.stamp = rc.get_clock().now().to_msg()
+        tw.twist.linear.x = -0.15
+        rc.cmd_vel_pub.publish(tw)
+        rclpy.spin_once(rc, timeout_sec=0.05)
+    stop = TwistStamped()
+    stop.header.stamp = rc.get_clock().now().to_msg()
+    rc.cmd_vel_pub.publish(stop)
+
+    rc.get_logger().info('Post-anomaly: turning right 90° (raw cmd_vel)...')
+    turn_speed = 1.0
+    turn_end = time.time() + (math.pi / 2.0) / turn_speed
+    while time.time() < turn_end:
+        tw = TwistStamped()
+        tw.header.stamp = rc.get_clock().now().to_msg()
+        tw.twist.angular.z = -turn_speed
+        rc.cmd_vel_pub.publish(tw)
+        rclpy.spin_once(rc, timeout_sec=0.05)
+    stop = TwistStamped()
+    stop.header.stamp = rc.get_clock().now().to_msg()
+    rc.cmd_vel_pub.publish(stop)
+
+    rc.get_logger().info('Post-anomaly: driving forward 2 s (raw cmd_vel)...')
+    fwd_end = time.time() + 2.0
+    while time.time() < fwd_end:
+        tw = TwistStamped()
+        tw.header.stamp = rc.get_clock().now().to_msg()
+        tw.twist.linear.x = 0.15
+        rc.cmd_vel_pub.publish(tw)
+        rclpy.spin_once(rc, timeout_sec=0.05)
+    stop = TwistStamped()
+    stop.header.stamp = rc.get_clock().now().to_msg()
+    rc.cmd_vel_pub.publish(stop)
+
+    rc.get_logger().info(f'Returning to {label_prefix} to report...')
+    _navigate(rc, gx, gy, float(q[2]), float(q[3]), f'Return to {label_prefix}')
+
+    say_anomalies(n_anomalies, n_tiles)
+    report_line = (
+        f'[REPORT] {label_prefix} {cell_color} cell: '
+        f'{n_anomalies} anomaly tile(s) of {n_tiles} inspected '
+        f'(color_match={rc._color_match}).'
+    )
+    print(report_line)
+    rc.get_logger().info(report_line)
+
+
+def _handle_face_at_standoff(rc, face_index, gx, gy, q, label_prefix,
+                             recognizer, anomaly_positions):
+    """At a face standoff: re-sample the close-up class, greet by gender,
+    listen for a task, play the response, and trigger the anomaly trip if asked.
+
+    Caller must have already navigated to (gx, gy, q); `face_index` indexes
+    into rc._confirmed['face'].
     """
-    # ── ROS init + node ─────────────────────────────────────────────────────
-    # RobotCommander wires up *all* the mission subscriptions/publishers in
-    # its constructor even though we only exercise a few of them here.
-    rclpy.init()
-    rc = RobotCommander()
+    # Re-classify up close before any audio fires — the original median was
+    # taken from several metres out and is often noisier than this reading.
+    print(f'[FACE] Arrived at {label_prefix}. Sampling face class for 2.5 s...')
+    new_class = rc.sample_face_class(duration=2.5, face_index=face_index)
+    face_class = new_class or rc._confirmed['face'][face_index][4]
+    gender = _resolve_gender(face_class)
+    print(f'[FACE] class={face_class!r}  gender={gender or "unknown"}')
 
-    # ── Arm pose + nav2 readiness ───────────────────────────────────────────
-    # arm_mover_actions uses depth=1 on its subscription, so we have to wait
-    # for it to actually subscribe before publishing — otherwise the first
-    # 'ring' command gets dropped silently. Then block until amcl and
-    # bt_navigator are both in the 'active' lifecycle state.
-    while rc.arm_pub.get_subscription_count() == 0:
-        rc.get_logger().info('Waiting for /arm_command subscriber...')
-        rclpy.spin_once(rc, timeout_sec=0.5)
-    rc.arm_pub.publish(String(data='ring'))
-    rc.get_logger().info('Arm → ring')
-    rc.wait_until_nav2_active()
-
-    # ── Patrol waypoints (same set as the full flow) ────────────────────────
-    # Each tuple is (x, y, qz, qw). The patrol stops at the first one where a
-    # face gets confirmed; we never visit the remaining points in this test.
-    positions = [
-        (-2.6569306611436088,   0.16201769689870127,  0.1107997044644789,   0.9938427569241445),
-        (-3.816358212773971,  -0.9086231768172194,    0.6172894726642737,   0.786736110101642),
-        (-1.9658334873514014,  -3.248015988877124,    0.35379317043051733,  0.9353236833079354),
-        (-1.2682009393012044,  -1.7584973254372267,   0.6963050240259081,   0.7177459951238178),
-        ( 0.2534043595121116,  -4.266760998946057,   -0.07499761435754064,  0.9971837131846256),
-        (-1.3306695404030213,  -4.268996079835222,   -0.999950799039901,    0.009919652184605814),
-        (-1.255948004244705,   -3.5475625400361914,   0.8650829533991125,   0.501628830648986),
-        ( 0.7975906528003365,  -2.803675605193642,    0.024640921542908818, 0.9996963663960754),
-        ( 0.024602486672440412,-0.6436527675802777,   0.5724657221444425,   0.8206314120945361),
-    ]
-
-    # Anomaly-cell standoffs. Keyed by colour so we can index directly with
-    # the intent ('ANOMALY_RED' → 'red') instead of a parallel list.
-    anomaly_positions = {
-        'red':   ( 0.23561884813549774, -3.9968579196473355, -0.6708838823574673, 0.7415624157095423),
-        'green': (-3.8830870946035407,  -2.4773224378833913, -0.995463176601127,  0.09514759077976365),
-    }
-
-    # ── Patrol until the first face is confirmed ────────────────────────────
-    # face_classification_publisher only publishes /face_classifier/confirmed_markers
-    # after buffering 15 same-face detections, so the callback typically fires
-    # a beat AFTER the robot arrives at a viewpoint. Add a ~1 s soak after
-    # each navigation to give that callback time to land before deciding to
-    # keep patrolling.
-    rc.get_logger().info('TEST: patrolling until first face is confirmed...')
-    found_face = False
-    for i, (x, y, qz, qw) in enumerate(positions):
-        # Block on nav2; if it rejects or fails, bail out cleanly.
-        if not _navigate(rc, x, y, qz, qw, f'Waypoint {i + 1}/{len(positions)}'):
-            rc.get_logger().error('Navigation failed, aborting test')
-            break
-
-        # Soak callbacks so any face confirmation triggered by this viewpoint
-        # has time to be processed before we test rc._confirmed['face'].
-        soak_end = time.time() + 1.0
-        while time.time() < soak_end:
-            rclpy.spin_once(rc, timeout_sec=0.1)
-
-        # First confirmed face wins — break out and skip remaining waypoints.
-        if rc._confirmed['face']:
-            rc.get_logger().info(
-                f'TEST: face confirmed at waypoint {i + 1} — leaving patrol.'
-            )
-            found_face = True
-            break
-
-    if not found_face:
-        # Patrol exhausted with nothing seen. Nothing to test — exit cleanly.
-        rc.get_logger().warn('TEST: patrol finished without confirming a face. Done.')
-        rc.destroy_node()
-        rclpy.shutdown()
-        return
-
-    # ── Approach the first confirmed face ───────────────────────────────────
-    # Face entry layout (written by RobotCommander._face_cb):
-    #   (cx, cy, gx, gy, face_class)
-    #     cx, cy     = face centre in map frame
-    #     gx, gy     = standoff in front of the face (precomputed upstream)
-    #     face_class = YOLO classifier label (e.g. 'alice_she_her_engineer')
-    # Yaw points the robot from the standoff back at the face centre.
-    cx, cy, gx, gy, face_class = rc._confirmed['face'][0]
-    yaw = math.atan2(cy - gy, cx - gx)
-    q = quaternion_from_euler(0, 0, yaw)
-    _navigate(rc, gx, gy, float(q[2]), float(q[3]), 'TEST: first face')
-
-    # ── Close-up reclassification ───────────────────────────────────────────
-    # The original class came from a few metres out (face_classification_publisher
-    # medians 15 obs before confirming). Now that the robot is right in front
-    # of the face, take a fresh majority vote from /face_class and overwrite
-    # the stored class — close-up YOLO is consistently more accurate.
-    refreshed = rc.sample_face_class(duration=2.5, face_index=0)
-    if refreshed:
-        rc.get_logger().info(
-            f'Face class refresh: was {face_class!r} → now {refreshed!r}'
-        )
-        face_class = refreshed   # keep the local var in sync for the printout below
+    if gender == 'man':
+        print('[SPEECH] Greeting man')
+        play('hi_man')
+    elif gender == 'woman':
+        print('[SPEECH] Greeting woman')
+        play('hi_woman')
     else:
-        rc.get_logger().warn(
-            'sample_face_class returned None — keeping the original class.'
-        )
+        print('[SPEECH] Generic greeting')
+        play('Greet')
 
-    # ── Greet + listen for ONE task intent ──────────────────────────────────
-    # Simplified vs the full flow: no woman-vs-man confirmation dance, no
-    # "are you sure" double-check. First valid task intent wins.
-    print(f'Face class: {face_class!r}')
-    print('Hi, which task should I perform?')
-    recognizer = sr.Recognizer()
-    intent = None
-    while intent not in TASK_INTENTS:
-        # listen_for_command blocks on the mic, runs Google STT, then
-        # passes the transcript through speech_intent.get_intent().
-        text, intent = listen_for_command(recognizer)
-        print(f'command: {text!r} | intent: {intent}')
-    print(RESPONSES.get(intent))
+    print(f'[SPEECH] Waiting for task command (gender={gender or "unknown"})...')
+    confirmed_task = _listen_for_task(recognizer, gender)
+    print(f'[SPEECH] Task confirmed: {confirmed_task}')
+    _respond_to_task(rc, confirmed_task)
 
-    # ── Execute the anomaly branch (only) ───────────────────────────────────
-    # BARRELS / RINGS / NOTHING fall through with just the canned acknowledgement
-    # above — this test only wires up the two anomaly tasks.
-    if intent in ('ANOMALY_RED', 'ANOMALY_GREEN'):
-        cell_color = 'red' if intent == 'ANOMALY_RED' else 'green'
+    rc.face_requests.append({
+        'identity': parse_face_class(face_class),
+        'task': confirmed_task,
+    })
 
-        # detect_tile_anomaly toggles these via /detection_done and /color_match.
-        # Reset them BEFORE we navigate so we don't read a stale True from a
-        # prior run still cached on the node.
-        rc._detection_done = False
-        rc._color_match = None
-
-        # Drive to the anomaly-cell standoff, kick off detection, block until
-        # the node signals it's finished (it writes results to JSON en route).
-        _navigate(rc, *anomaly_positions[cell_color],
-                  f'TEST: anomaly {cell_color} cell')
-        rc._start_detection_pub.publish(Bool(data=True))
-        rc.get_logger().info(f'TEST: detection triggered at {cell_color} cell, waiting...')
-        while not rc._detection_done:
-            rclpy.spin_once(rc, timeout_sec=0.1)
-
-        # Read the per-tile JSON the anomaly node wrote and count anomalies.
-        # Wrapped in try/except because a missing/garbled file shouldn't kill
-        # the test — we'd just report zero.
-        n_anomalies, n_tiles = 0, 0
-        try:
-            with open('/home/gamma/colcon_ws/tile_anomaly_results.json') as f:
-                data = json.load(f)
-            n_tiles = int(data.get('tiles_inspected', 0))
-            n_anomalies = sum(1 for r in data.get('results', []) if r.get('anomaly'))
-        except Exception as ex:
-            rc.get_logger().warn(f'Could not read anomaly results: {ex}')
-
-        # ── Open-loop escape from the cell ──────────────────────────────────
-        # nav2 can refuse a goal-from-inside-the-cell when the costmap thinks
-        # we're pressed against the wall. Turn 90° right + creep forward 2 s
-        # on raw /cmd_vel so we're clear of the cell BEFORE asking nav2 to
-        # plan a path back to the face.
-        rc.get_logger().info('TEST: post-anomaly 90° right turn (raw cmd_vel)...')
-        turn_speed = 1.0  # rad/s
-        turn_end = time.time() + (math.pi / 2.0) / turn_speed
-        while time.time() < turn_end:
-            tw = TwistStamped()
-            tw.header.stamp = rc.get_clock().now().to_msg()
-            tw.twist.angular.z = -turn_speed   # negative z = right turn in REP-103
-            rc.cmd_vel_pub.publish(tw)
-            rclpy.spin_once(rc, timeout_sec=0.05)
-        stop = TwistStamped()
-        stop.header.stamp = rc.get_clock().now().to_msg()
-        rc.cmd_vel_pub.publish(stop)
-
-        rc.get_logger().info('TEST: post-anomaly 2 s forward (raw cmd_vel)...')
-        fwd_end = time.time() + 2.0
-        while time.time() < fwd_end:
-            tw = TwistStamped()
-            tw.header.stamp = rc.get_clock().now().to_msg()
-            tw.twist.linear.x = 0.15
-            rc.cmd_vel_pub.publish(tw)
-            rclpy.spin_once(rc, timeout_sec=0.05)
-        stop = TwistStamped()
-        stop.header.stamp = rc.get_clock().now().to_msg()
-        rc.cmd_vel_pub.publish(stop)
-
-        # Now safe to ask nav2 for a waypoint back to the face standoff and
-        # deliver the report in person (we reuse the gx/gy/q from earlier).
-        _navigate(rc, gx, gy, float(q[2]), float(q[3]), 'TEST: return to face')
-
-        # No PDF in this test — just print the count to the console as asked.
-        print(f'[TEST REPORT] {cell_color} cell: {n_anomalies} anomaly tile(s) '
-              f'of {n_tiles} inspected (color_match={rc._color_match}).')
-
-    # Clean shutdown so we don't leak the executor or hang on Ctrl-C.
-    rc.destroy_node()
-    rclpy.shutdown()
+    if confirmed_task in ('ANOMALY_RED', 'ANOMALY_GREEN'):
+        cell_color = 'red' if confirmed_task == 'ANOMALY_RED' else 'green'
+        _run_anomaly_trip(rc, cell_color, anomaly_positions, label_prefix,
+                          gx, gy, q)
 
 
-def _main_full():
-    """Full mission flow (waypoints + horizontal-barrel detours + faces +
-    speech + anomaly + PDF + blue-line follow). NOT called while the
-    face-intent test in `main` is active — swap names to re-enable."""
+def main():
+    """Full mission flow: waypoints + horizontal-barrel detours + faces +
+    speech + anomaly + PDF + blue-line follow."""
     rclpy.init()
     rc = RobotCommander()
 
@@ -972,19 +1184,23 @@ def _main_full():
     positions = [
         (-2.6569306611436088,   0.16201769689870127,  0.1107997044644789,   0.9938427569241445),
         (-3.816358212773971,  -0.9086231768172194,    0.6172894726642737,   0.786736110101642),
+        (-3.956416238895057,    -0.3969542758607385, -0.699399301519097,    0.7147311501778828), 
         #(-2.9503815926671053,   -3.2369627304892323,  0.4752767559043263,   0.8798363514296619),
         (-1.9658334873514014,  -3.248015988877124,    0.35379317043051733,  0.9353236833079354),
-        (-1.2682009393012044,  -1.7584973254372267,   0.6963050240259081,   0.7177459951238178),
+        #(-1.2682009393012044,  -1.7584973254372267,   0.6963050240259081,   0.7177459951238178),
         (0.2534043595121116,  -4.266760998946057,    -0.07499761435754064,  0.9971837131846256),
         (-1.3306695404030213,   -4.268996079835222,  -0.999950799039901,    0.009919652184605814),
-        (-1.255948004244705, -3.5475625400361914,    0.8650829533991125,   0.501628830648986),
+        (-1.255948004244705, -3.5475625400361914,    0.8650829533991125,    0.501628830648986),
         ( 0.7975906528003365,  -2.803675605193642,    0.024640921542908818, 0.9996963663960754),
-        ( 0.024602486672440412, -0.6436527675802777,  0.5724657221444425,   0.8206314120945361),
+        (0.6111489652726179,    -1.2718060081019265, -0.19227055728330686,  0.9813419550808814 ),
+        #( 0.024602486672440412, -0.6436527675802777,  0.5724657221444425,   0.8206314120945361),
+        (1.625114060765717,   0.22486767544404362,   0.9621911044781152,    0.272375253030052),
+        (0.33009879706401773,   0.1367671688995752,    0.9242716147220383,  0.38173548724098993), 
     ]
 
     anomaly_positions = {
         'red':   ( 0.23561884813549774, -3.9968579196473355, -0.6708838823574673, 0.7415624157095423),
-        'green': (-3.8830870946035407,  -2.4773224378833913, -0.995463176601127,  0.09514759077976365),
+        'green': (-4.474548391702069,   -2.442423935915113,   0.9998693915777004, 0.016161676461284226),
     }
 
 
@@ -1010,138 +1226,12 @@ def _main_full():
     rc.get_logger().info(f'Navigating to {len(face_entries)} confirmed face(s).')
     recognizer = sr.Recognizer()
     for i, face_entry in enumerate(face_entries):
-        cx, cy, gx, gy, face_class = face_entry
+        cx, cy, gx, gy, _ = face_entry
         yaw = math.atan2(cy - gy, cx - gx)
         q = quaternion_from_euler(0, 0, yaw)
         _navigate(rc, gx, gy, float(q[2]), float(q[3]), f'Face {i + 1}')
-    
-        cls_lower = (face_class or '').lower()
-        if cls_lower == 'she_her':
-            gender = 'woman'
-        elif cls_lower == 'he_him':
-            gender = 'man'
-        else:
-            gender = None
-        print(f'Face {i + 1} gender: {gender or "unknown"} (class={face_class!r})')
-    
-        if gender == 'man':
-            print('Hi man, which task should I perform?')
-        elif gender == 'woman':
-            print('Hi woman, which task should I perform?')
-        else:
-            print('Hi, which task should I perform?')
-    
-        confirmed_task = None
-        if gender == 'woman':
-            # Confirmation flow: same task twice OR YES executes pending; NO cancels.
-            pending_task = None
-            response_count = {k: 0 for k in TASK_INTENTS}
-            done = False
-            while not done:
-                text, intent = listen_for_command(recognizer)
-                print(f'command: {text} | intent: {intent}')
-                if intent is None:
-                    continue
-                if intent == 'YES':
-                    if pending_task is not None:
-                        print(RESPONSES.get(pending_task))
-                        confirmed_task = pending_task
-                        done = True
-                elif intent == 'NO':
-                    pending_task = None
-                    response_count = {k: 0 for k in TASK_INTENTS}
-                elif intent in TASK_INTENTS:
-                    pending_task = intent
-                    response_count[intent] += 1
-                    if response_count[intent] >= 2:
-                        print(RESPONSES.get(pending_task))
-                        confirmed_task = pending_task
-                        done = True
-                    else:
-                        print('Are you sure you want me to perform this task?')
-        else:
-            # Man / unknown: first task intent wins, no confirmation.
-            text, intent = None, None
-            while intent not in TASK_INTENTS:
-                text, intent = listen_for_command(recognizer)
-                print(f'command: {text} | intent: {intent}')
-            print(RESPONSES.get(intent))
-            confirmed_task = intent
-    
-        rc.face_requests.append({
-            'identity': parse_face_class(face_class),
-            'task': confirmed_task,
-        })
-
-        # If the face requested an anomaly check, run it now: drive to the
-        # matching cell, trigger detection, then come back to this face and
-        # print the result so the report is delivered face-to-face.
-        if confirmed_task in ('ANOMALY_RED', 'ANOMALY_GREEN'):
-            cell_color = 'red' if confirmed_task == 'ANOMALY_RED' else 'green'
-            rc.get_logger().info(f'Face {i + 1} requested {cell_color}-cell anomaly check.')
-
-            rc._detection_done = False
-            rc._color_match = None
-            _navigate(rc, *anomaly_positions[cell_color],
-                      f'Anomaly {cell_color} cell (face {i + 1})')
-            rc._start_detection_pub.publish(Bool(data=True))
-            rc.anomaly_cells_visited.append(cell_color)
-            rc.get_logger().info(
-                f'Detection triggered at {cell_color} cell. Waiting for /detection_done...'
-            )
-            while not rc._detection_done:
-                rclpy.spin_once(rc, timeout_sec=0.1)
-            rc.get_logger().info(f'Detection done at {cell_color} cell.')
-
-            # detect_tile_anomaly writes its findings here each run.
-            n_anomalies, n_tiles = 0, 0
-            try:
-                with open('/home/gamma/colcon_ws/tile_anomaly_results.json') as f:
-                    data = json.load(f)
-                n_tiles = int(data.get('tiles_inspected', 0))
-                n_anomalies = sum(1 for r in data.get('results', []) if r.get('anomaly'))
-            except Exception as ex:
-                rc.get_logger().warn(f'Could not read tile_anomaly_results.json: {ex}')
-
-            # Open-loop escape from the cell before handing back to nav2: a 90°
-            # right turn + 2 s forward via raw /cmd_vel. Bypasses costmap goal
-            # planning so a "stuck against the wall" state can't reject the
-            # rotation. NO waypoints here — just turn and drive out.
-            rc.get_logger().info('Post-anomaly: turning right 90° (raw cmd_vel)...')
-            turn_speed = 1.0  # rad/s
-            turn_end = time.time() + (math.pi / 2.0) / turn_speed
-            while time.time() < turn_end:
-                tw = TwistStamped()
-                tw.header.stamp = rc.get_clock().now().to_msg()
-                tw.twist.angular.z = -turn_speed
-                rc.cmd_vel_pub.publish(tw)
-                rclpy.spin_once(rc, timeout_sec=0.05)
-            stop = TwistStamped()
-            stop.header.stamp = rc.get_clock().now().to_msg()
-            rc.cmd_vel_pub.publish(stop)
-
-            rc.get_logger().info('Post-anomaly: driving forward 2 s (raw cmd_vel)...')
-            fwd_end = time.time() + 2.0
-            while time.time() < fwd_end:
-                tw = TwistStamped()
-                tw.header.stamp = rc.get_clock().now().to_msg()
-                tw.twist.linear.x = 0.15
-                rc.cmd_vel_pub.publish(tw)
-                rclpy.spin_once(rc, timeout_sec=0.05)
-            stop = TwistStamped()
-            stop.header.stamp = rc.get_clock().now().to_msg()
-            rc.cmd_vel_pub.publish(stop)
-
-            rc.get_logger().info(f'Returning to face {i + 1} to report...')
-            _navigate(rc, gx, gy, float(q[2]), float(q[3]), f'Return to face {i + 1}')
-
-            report_line = (
-                f'[REPORT to face {i + 1}] {cell_color} cell: '
-                f'{n_anomalies} anomaly tile(s) of {n_tiles} inspected '
-                f'(color_match={rc._color_match}).'
-            )
-            print(report_line)
-            rc.get_logger().info(report_line)
+        _handle_face_at_standoff(rc, i, gx, gy, q, f'face {i + 1}',
+                                 recognizer, anomaly_positions)
 
     # ── Inspection report ─────────────────────────────────────────────────────
     try:
@@ -1156,7 +1246,7 @@ def _main_full():
     rc.detections_enabled = True
     rc.get_logger().info('Detections re-enabled for blue-line phase.')
 
-    # ── Phase 4: blue-line follow until a face appears ────────────────────────
+    # ── Phase 4: blue-line follow until close to a face ───────────────────────
     blue_start = (
         2.753821154322128, -0.3198221794622692,
         -0.7250343149504763, 0.6887127428357148,
@@ -1169,38 +1259,15 @@ def _main_full():
     while time.time() < settle_end:
         rclpy.spin_once(rc, timeout_sec=0.1)
 
-    baseline_faces = len(rc._confirmed['face'])
-    rc.get_logger().info(f'Starting line_follower_left (baseline faces={baseline_faces})')
-    line_proc = subprocess.Popen(
-        ['ros2', 'run', 'dis_tutorial7', 'line_follower_left.py'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    FACE_APPROACH_DIST = 1.0  # metres — stop follower when robot is this close to a face
 
-    new_face = None
-    try:
-        while new_face is None:
-            rclpy.spin_once(rc, timeout_sec=0.1)
-            if len(rc._confirmed['face']) > baseline_faces:
-                new_face = rc._confirmed['face'][-1]
-                break
-            if line_proc.poll() is not None:
-                rc.get_logger().error('line_follower_left exited unexpectedly')
-                break
-    finally:
-        rc.get_logger().info('Stopping line_follower_left...')
-        line_proc.send_signal(signal.SIGINT)
-        try:
-            line_proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            line_proc.kill()
-            line_proc.wait()
+    baseline_faces = len(rc._confirmed['face'])
+    new_face = rc.follow_line_until_face(baseline_faces, FACE_APPROACH_DIST)
 
     if new_face is not None:
-        cx, cy, gx, gy, face_class = new_face
-        rc.get_logger().info(f'New face during line follow: class={face_class!r}')
-        yaw = math.atan2(cy - gy, cx - gx)
-        q = quaternion_from_euler(0, 0, yaw)
-        _navigate(rc, gx, gy, float(q[2]), float(q[3]), 'Final face')
+        cx, cy, gx, gy, _ = new_face
+        rc.get_logger().info('Line-follow face detected — playing report audio.')
+        play('here_is_the_report')
 
     rc.destroy_node()
     rclpy.shutdown()
