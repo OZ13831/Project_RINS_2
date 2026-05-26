@@ -1227,8 +1227,16 @@ def main():
     recognizer = sr.Recognizer()
     for i, face_entry in enumerate(face_entries):
         cx, cy, gx, gy, _ = face_entry
+        # Pull the standoff back toward the face along the normal if the
+        # original 1 m point sits on a costmap obstacle. Mirrors the horizontal
+        # barrel logic in _visit_barrel_and_check_spill.
+        gx, gy = rc.furthest_free_along_normal(cx, cy, gx, gy)
         yaw = math.atan2(cy - gy, cx - gx)
         q = quaternion_from_euler(0, 0, yaw)
+        rc.get_logger().info(
+            f'Face {i + 1}: face=({cx:.2f},{cy:.2f}) free-extended goal=({gx:.2f},{gy:.2f}) '
+            f'dist={math.hypot(gx - cx, gy - cy):.2f}m'
+        )
         _navigate(rc, gx, gy, float(q[2]), float(q[3]), f'Face {i + 1}')
         _handle_face_at_standoff(rc, i, gx, gy, q, f'face {i + 1}',
                                  recognizer, anomaly_positions)
