@@ -23,11 +23,11 @@ After detecting a circle, we used the point cloud callback to get a 3D point on 
 
 ### 1.3.2 Color Classification
 
-For color classification, we captured several images of the rings from different angles. From these images, we built color histograms for each ring color.
-
-**TODO:** Gasper: describe how the histograms are generated.
+For color classification, we captured several images of the rings from different angles. From these images, we applied the mask already generated in detection with OpenCV's `HoughCircles`, then all non-black pixels were converted to HSV and their hue was extracted, from which we built a 180 bin histogram.
 
 We averaged all histograms for each color. The resulting average histograms were then used for classification. When a ring was detected, we compared its histogram to the stored color histograms and incremented the counter for the most similar color in a dictionary of possible colors.
+
+We did not build a histogram for black rings, we took care of that by first converting the detected ring to HSV and looking at the average 'value', if it was below a threshold we counted it as black, if not we continued with the classification.
 
 We also used Lowe's ratio test to make sure that the difference between the best and second-best matches was large enough. After a certain number of detections, the ring was assigned the color with the highest number of classifications.
 
@@ -62,8 +62,6 @@ For face detection, we used the provided YOLOv8n model. Detection worked well in
 Ring detection was implemented using OpenCV's `HoughCircles` function, which performs Hough transform circle detection on the RGB image. We tried using the same depth-image approach as in simulation, but the depth information arrived too slowly in the real setup.
 
 Using RGB introduced new problems, such as detecting round objects that were not rings. For example, the back of a person's head could rarely be classified as a circle. We also added checks to verify whether the ring is inside the map and whether it is near a wall or box.
-
-**TODO:** Add the method used to reject fake rings on boxes.
 
 ### 2.3.2 Color Classification
 
